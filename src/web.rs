@@ -76,7 +76,7 @@ fn handle(app: &Arc<Mutex<App>>, req: &Request) -> Resp {
             };
             let mut a = app.lock().unwrap();
             a.audio.volume = v.clamp(0.0, 1.5);
-            a.settings_dirty = true;
+            a.save_settings();
             ok()
         }
         (Method::Post, "/api/gain") => {

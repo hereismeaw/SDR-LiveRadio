@@ -347,7 +347,8 @@ fn now_playing(st: Option<&Station>, label: &str) -> String {
 /// they fit in the device bandwidth. Returns when mode, frequency or device changes.
 fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demod: Demod, cfg: &WorkerCfg) -> (Open, Result<(), String>) {
     let mut dev = dev;
-    let f = hz as f64;
+    let mut hz = hz;
+    let mut f = hz as f64;
     let (streams, stream_set, enh_set0, am_bw) = {
         let a = app.lock().unwrap();
         (a.streams.clone(), a.stream.clone(), a.enhance.clone(), a.audio.am_bw_hz as f64)
@@ -385,11 +386,12 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
             (c, r, am_bw)
         }
     };
-    let label = match demod {
+    let label_of = |f: f64| match demod {
         Demod::Wfm => format!("{:.2} MHz FM", f / 1e6),
         Demod::Am if f < 30e6 => format!("{:.0} kHz AM", f / 1e3),
         Demod::Am => format!("{:.3} MHz AM", f / 1e6),
     };
+    let mut label = label_of(f);
     let mut chans: Vec<Chan> = freqs.iter().enumerate().map(|(i, &x)| Chan::new(x, i == 0, audio_rate, cutoff)).collect();
 
     // streaming: open hub mounts and (optionally) Icecast pushes
@@ -525,6 +527,27 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
             let restart = (a.streams.clone(), a.stream.clone()) != session_streams;
             (a.mode, a.device_id.clone(), a.rescan_devices, a.audio.clone(), a.enhance.clone(), rec_req, restart)
         };
+        // Drag-tuning: a new frequency inside the current capture is just a different
+        // FFT slice, so move the channel in place instead of restarting the stream.
+        if let Mode::Listen { hz: nh, demod: nd } = mode {
+            let nf = nh as f64;
+            let margin = if demod == Demod::Wfm { 130e3 } else { cur_am_bw + 20e3 };
+            let inside = (nf - lo).abs() < rate / 2.0 - margin && (nf - lo).abs() > 60e3;
+            if nd == demod && nh != hz && chans.len() == 1 && chans[0].mount.is_none() && inside {
+                hz = nh;
+                f = nf;
+                label = label_of(f);
+                chans[0] = Chan::new(f, true, audio_rate, if demod == Demod::Wfm { 15_000.0 } else { cur_am_bw });
+                match demod {
+                    Demod::Wfm => ch.set_filter(0, f - lo, 100e3, 114e3),
+                    Demod::Am => ch.set_filter(0, f - lo, cur_am_bw, cur_am_bw + 1_500.0),
+                }
+                let mut a = app.lock().unwrap();
+                a.status = format!("Listening {label}");
+                a.live.pilot_locked = false;
+                a.live.stereo_blend = false;
+            }
+        }
         if mode != (Mode::Listen { hz, demod }) || rescan || dev_id != app_open_id(app) || restart {
             break Ok(());
         }

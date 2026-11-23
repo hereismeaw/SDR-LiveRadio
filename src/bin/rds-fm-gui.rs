@@ -59,6 +59,9 @@ struct Gui {
     preset_csv: String,
     log_filter: String,
     log_kind: String,
+    /// Last frequency sent while dragging (live retune is throttled to raster changes).
+    drag_sent: Option<f64>,
+    scroll_acc: f32,
 }
 
 fn fmt_db(v: f32, unit: &str) -> String {
@@ -143,6 +146,118 @@ impl Gui {
             preset_csv: docs.join("rds-fm-presets.csv").display().to_string(),
             log_filter: String::new(),
             log_kind: "all".into(),
+            drag_sent: None,
+            scroll_acc: 0.0,
+        }
+    }
+
+    /// Drag-to-tune: follow the pointer on the band raster. While dragging inside the
+    /// current capture the worker moves the channel in place (instant); a frequency
+    /// outside it is tuned when the mouse is released.
+    fn drag_tune(&mut self, a: &App, f: f64, released: bool, ed: &mut Vec<Edit>) {
+        let band = Band::of_freq(f);
+        let (lo, hi) = band.range();
+        let step = band.step();
+        let snapped = ((f / step).round() * step).clamp(lo, hi);
+        self.freq_ui = snapped;
+        self.selected = Some((snapped / 1e3).round() as u32);
+        let current = match a.mode {
+            Mode::Listen { hz, .. } => Some(hz as f64),
+            _ => None,
+        };
+        let inside = a
+            .capture_window
+            .is_some_and(|(wl, wh)| current.is_some() && snapped > wl + 150e3 && snapped < wh - 150e3 && Band::of_freq(current.unwrap()) == band);
+        let send = if released {
+            current.map(|c| (c - snapped).abs() > 1.0).unwrap_or(true)
+        } else {
+            inside && self.drag_sent != Some(snapped) && current.map(|c| (c - snapped).abs() > 1.0).unwrap_or(false)
+        };
+        if send {
+            self.drag_sent = Some(snapped);
+            ed.push(Box::new(move |a| {
+                // in-place retune keeps the saved settings untouched until release
+                let dirty = a.settings_dirty;
+                a.listen(snapped);
+                if !released {
+                    a.settings_dirty = dirty;
+                }
+            }));
+        }
+        if released {
+            self.drag_sent = None;
+        }
+    }
+
+    fn tuning_dial(&mut self, ui: &mut egui::Ui, a: &App, ed: &mut Vec<Edit>) {
+        let band = a.band;
+        let (lo, hi) = band.range();
+        let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), 46.0), Sense::click_and_drag());
+        let rect = resp.rect;
+        let v = ui.visuals().clone();
+        painter.rect_filled(rect, 6.0, v.extreme_bg_color);
+        let scale = Rect::from_min_max(pos2(rect.left() + 14.0, rect.top()), pos2(rect.right() - 14.0, rect.bottom()));
+        let x_of = |f: f64| scale.left() + ((f - lo) / (hi - lo)) as f32 * scale.width();
+        let f_of = |x: f32| lo + ((x - scale.left()) / scale.width()).clamp(0.0, 1.0) as f64 * (hi - lo);
+        let weak = v.weak_text_color();
+        let tick = v.widgets.noninteractive.fg_stroke.color.gamma_multiply(0.6);
+        // scale ticks
+        let span = hi - lo;
+        let major = [1e3, 10e3, 50e3, 100e3, 500e3, 1e6, 2e6, 5e6].into_iter().find(|s| span / s <= 14.0).unwrap_or(5e6);
+        let minor = major / 5.0;
+        let small = FontId::proportional(10.5);
+        let mut t = (lo / minor).ceil() * minor;
+        while t <= hi + 1.0 {
+            let x = x_of(t);
+            let is_major = ((t / major).round() * major - t).abs() < 1.0;
+            let h = if is_major { 12.0 } else { 6.0 };
+            painter.line_segment([pos2(x, rect.bottom() - 4.0 - h), pos2(x, rect.bottom() - 4.0)], Stroke::new(1.0, tick));
+            if is_major {
+                let label = if hi < 30e6 { format!("{:.0}", t / 1e3) } else { format!("{:.0}", t / 1e6) };
+                painter.text(pos2(x, rect.bottom() - 18.0), Align2::CENTER_BOTTOM, label, small.clone(), weak);
+            }
+            t += minor;
+        }
+        // presets and RDS stations
+        for p in a.presets.iter().filter(|p| p.freq_hz >= lo && p.freq_hz <= hi) {
+            painter.text(pos2(x_of(p.freq_hz), rect.top() + 2.0), Align2::CENTER_TOP, "★", FontId::proportional(11.0), WARN);
+        }
+        if band == Band::Fm {
+            for s in a.stations.values().filter(|s| s.has_rds()) {
+                let x = x_of(s.freq_khz as f64 * 1e3);
+                painter.circle_filled(pos2(x, rect.top() + 18.0), 2.5, GOOD);
+            }
+        }
+        // needle
+        let nx = x_of(self.freq_ui.clamp(lo, hi));
+        painter.line_segment([pos2(nx, rect.top() + 2.0), pos2(nx, rect.bottom() - 2.0)], Stroke::new(2.5, BAD));
+        let txt = fmt_freq(self.freq_ui);
+        let galley = painter.layout_no_wrap(txt.clone(), FontId::monospace(12.0), Color32::WHITE);
+        let w = galley.size().x + 10.0;
+        let bx = (nx - w / 2.0).clamp(rect.left() + 2.0, rect.right() - w - 2.0);
+        let r = Rect::from_min_size(pos2(bx, rect.top() + 2.0), vec2(w, 16.0));
+        painter.rect_filled(r, 3.0, BAD);
+        painter.text(r.center(), Align2::CENTER_CENTER, txt, FontId::monospace(12.0), Color32::WHITE);
+
+        let resp = resp
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+            .on_hover_text_at_pointer("Drag to tune · scroll wheel: one channel step");
+        if let Some(p) = resp.interact_pointer_pos() {
+            if resp.dragged() || resp.clicked() {
+                self.drag_tune(a, f_of(p.x), resp.clicked(), ed);
+            }
+        }
+        if resp.drag_stopped() {
+            self.drag_tune(a, self.freq_ui, true, ed);
+        }
+        if resp.hovered() {
+            self.scroll_acc += ui.input(|i| i.smooth_scroll_delta.y + i.smooth_scroll_delta.x);
+            let steps = (self.scroll_acc / 40.0).trunc();
+            if steps != 0.0 {
+                self.scroll_acc -= steps * 40.0;
+                let f = (self.freq_ui + steps as f64 * band.step()).clamp(lo, hi);
+                self.drag_tune(a, f, true, ed);
+            }
         }
     }
 
@@ -751,7 +866,7 @@ impl Gui {
     // ------------------------------------------------------------------ spectrum
 
     fn spectrum(&mut self, ui: &mut egui::Ui, a: &App, ed: &mut Vec<Edit>) {
-        let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click());
+        let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
         let v = ui.visuals().clone();
         let accent = v.selection.bg_fill;
@@ -873,7 +988,23 @@ impl Gui {
             let dx = if p.x > plot.center().x { -6.0 } else { 6.0 };
             painter.text(pos2(p.x + dx, plot.bottom() - 4.0), anchor, fmt_freq(f), small.clone(), v.strong_text_color());
         }
-        let resp = resp.on_hover_text_at_pointer("Click: select · Double-click: listen");
+        // drag on the spectrum = tune (fine-tuning inside the live view)
+        if let Some(p) = resp.interact_pointer_pos() {
+            if resp.dragged() {
+                let f = f_of(p.x.clamp(plot.left(), plot.right()));
+                if Band::of_freq(f) == a.band {
+                    self.drag_tune(a, f, false, ed);
+                }
+                painter.line_segment([pos2(x_of(self.freq_ui), plot.top()), pos2(x_of(self.freq_ui), plot.bottom())], Stroke::new(2.0, BAD));
+            }
+        }
+        if resp.drag_stopped() {
+            self.drag_tune(a, self.freq_ui, true, ed);
+            return;
+        }
+        let resp = resp
+            .on_hover_cursor(egui::CursorIcon::Crosshair)
+            .on_hover_text_at_pointer("Click: select · Double-click: listen · Drag: tune");
         if let Some(p) = resp.interact_pointer_pos().filter(|p| plot.contains(*p)) {
             let f = f_of(p.x);
             let band = Band::of_freq(f);
@@ -1654,6 +1785,11 @@ impl eframe::App for Gui {
         {
             let a = shared.lock().unwrap();
             egui::Panel::top("top").show(ui, |ui| self.top_bar(ui, &a, &mut ed));
+            egui::Panel::top("dial").show(ui, |ui| {
+                ui.add_space(3.0);
+                self.tuning_dial(ui, &a, &mut ed);
+                ui.add_space(3.0);
+            });
             egui::Panel::top("spectrum")
                 .resizable(true)
                 .default_size(190.0)
