@@ -58,6 +58,7 @@ const MD_ERROR_OVERFLOW: i32 = 0x8;
 struct Api {
     usrp_make: unsafe extern "C" fn(*mut Handle, *const c_char) -> UhdErr,
     usrp_free: unsafe extern "C" fn(*mut Handle) -> UhdErr,
+    get_rx_num_channels: unsafe extern "C" fn(Handle, *mut usize) -> UhdErr,
     set_rx_rate: unsafe extern "C" fn(Handle, f64, usize) -> UhdErr,
     get_rx_rate: unsafe extern "C" fn(Handle, usize, *mut f64) -> UhdErr,
     set_rx_freq: unsafe extern "C" fn(Handle, *mut TuneRequest, usize, *mut TuneResult) -> UhdErr,
@@ -97,6 +98,7 @@ impl Api {
         Ok(Api {
             usrp_make: sym!(lib, "uhd_usrp_make"),
             usrp_free: sym!(lib, "uhd_usrp_free"),
+            get_rx_num_channels: sym!(lib, "uhd_usrp_get_rx_num_channels"),
             set_rx_rate: sym!(lib, "uhd_usrp_set_rx_rate"),
             get_rx_rate: sym!(lib, "uhd_usrp_get_rx_rate"),
             set_rx_freq: sym!(lib, "uhd_usrp_set_rx_freq"),
@@ -161,6 +163,7 @@ pub struct Usrp {
     usrp: Handle,
     streamer: Handle,
     md: Handle,
+    channel: usize,
     max_samps: usize,
     pub overflows: u64,
 }
@@ -213,16 +216,21 @@ impl Usrp {
         Ok(items)
     }
 
-    pub fn open(dll: &Path, args: &str) -> Result<Self, String> {
+    pub fn open(dll: &Path, args: &str, channel: usize) -> Result<Self, String> {
         let api = Api::load(dll)?;
         let cargs = CString::new(args).map_err(|e| e.to_string())?;
         let mut usrp: Handle = null_mut();
         api.check(unsafe { (api.usrp_make)(&mut usrp, cargs.as_ptr()) }, "open USRP")?;
-        let mut md: Handle = null_mut();
-        api.check(unsafe { (api.md_make)(&mut md) }, "rx metadata")?;
-        let mut streamer: Handle = null_mut();
-        api.check(unsafe { (api.streamer_make)(&mut streamer) }, "rx streamer")?;
-        let mut u = Usrp { api, usrp, streamer, md, max_samps: 0, overflows: 0 };
+        let mut u = Usrp {
+            api, usrp, channel, md: null_mut(), streamer: null_mut(), max_samps: 0, overflows: 0,
+        };
+        let mut count = 0;
+        u.api.check(unsafe { (u.api.get_rx_num_channels)(u.usrp, &mut count) }, "RX channel count")?;
+        if channel >= count {
+            return Err(format!("RX channel {channel} is unavailable. UHD reports {count} RX channel(s)."));
+        }
+        u.api.check(unsafe { (u.api.md_make)(&mut u.md) }, "rx metadata")?;
+        u.api.check(unsafe { (u.api.streamer_make)(&mut u.streamer) }, "rx streamer")?;
         u.setup_stream()?;
         Ok(u)
     }
@@ -231,7 +239,7 @@ impl Usrp {
         let cpu = CString::new("fc32").unwrap();
         let otw = CString::new("sc16").unwrap();
         let args = CString::new("").unwrap();
-        let chans = [0usize];
+        let chans = [self.channel];
         let mut sa = StreamArgs {
             cpu_format: cpu.as_ptr(),
             otw_format: otw.as_ptr(),
@@ -248,25 +256,25 @@ impl Usrp {
 
     /// Set the RX sample rate; returns the actual rate. Recreates the stream.
     pub fn set_rate(&mut self, rate: f64) -> Result<f64, String> {
-        self.api.check(unsafe { (self.api.set_rx_rate)(self.usrp, rate, 0) }, "set_rx_rate")?;
+        self.api.check(unsafe { (self.api.set_rx_rate)(self.usrp, rate, self.channel) }, "set_rx_rate")?;
         let mut actual = 0.0;
-        self.api.check(unsafe { (self.api.get_rx_rate)(self.usrp, 0, &mut actual) }, "get_rx_rate")?;
+        self.api.check(unsafe { (self.api.get_rx_rate)(self.usrp, self.channel, &mut actual) }, "get_rx_rate")?;
         self.setup_stream()?;
         Ok(actual)
     }
 
     pub fn set_gain(&mut self, gain: f64) -> Result<(), String> {
         let name = CString::new("").unwrap();
-        self.api.check(unsafe { (self.api.set_rx_gain)(self.usrp, gain, 0, name.as_ptr()) }, "set_rx_gain")
+        self.api.check(unsafe { (self.api.set_rx_gain)(self.usrp, gain, self.channel, name.as_ptr()) }, "set_rx_gain")
     }
 
     pub fn set_antenna(&mut self, ant: &str) -> Result<(), String> {
         let a = CString::new(ant).map_err(|e| e.to_string())?;
-        self.api.check(unsafe { (self.api.set_rx_antenna)(self.usrp, a.as_ptr(), 0) }, "set_rx_antenna")
+        self.api.check(unsafe { (self.api.set_rx_antenna)(self.usrp, a.as_ptr(), self.channel) }, "set_rx_antenna")
     }
 
     pub fn set_bandwidth(&mut self, bw: f64) -> Result<(), String> {
-        self.api.check(unsafe { (self.api.set_rx_bandwidth)(self.usrp, bw, 0) }, "set_rx_bandwidth")
+        self.api.check(unsafe { (self.api.set_rx_bandwidth)(self.usrp, bw, self.channel) }, "set_rx_bandwidth")
     }
 
     /// Tune RX; returns the actual center frequency.
@@ -281,9 +289,9 @@ impl Usrp {
             args: args.as_ptr(),
         };
         let mut res = TuneResult::default();
-        self.api.check(unsafe { (self.api.set_rx_freq)(self.usrp, &mut req, 0, &mut res) }, "set_rx_freq")?;
+        self.api.check(unsafe { (self.api.set_rx_freq)(self.usrp, &mut req, self.channel, &mut res) }, "set_rx_freq")?;
         let mut f = 0.0;
-        self.api.check(unsafe { (self.api.get_rx_freq)(self.usrp, 0, &mut f) }, "get_rx_freq")?;
+        self.api.check(unsafe { (self.api.get_rx_freq)(self.usrp, self.channel, &mut f) }, "get_rx_freq")?;
         Ok(f)
     }
 

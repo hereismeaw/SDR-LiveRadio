@@ -193,6 +193,8 @@ pub struct Live {
     /// (start Hz, stop Hz, dBFS bins) around the listened frequency.
     pub spectrum: Option<(f64, f64, Vec<f32>)>,
     pub streams: Vec<LiveStream>,
+    /// Tuned kHz -> station kHz, confirmed by PI in the current listen session.
+    pub station_aliases: BTreeMap<u32, u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +217,7 @@ pub struct App {
     pub gain: f64,
     pub agc: bool,
     pub antenna: String,
+    pub rx_channel: usize,
     pub bias_tee: bool,
     pub audio: AudioSettings,
     pub rec: RecordSettings,
@@ -223,6 +226,7 @@ pub struct App {
     pub rec_status: Option<RecStatus>,
     pub traffic_alert: bool,
     pub tmc_names: HashMap<u16, String>,
+    pub tmc_locations: crate::tmc::LocationNames,
     pub live: Live,
     pub status: String,
     pub error: Option<String>,
@@ -260,6 +264,7 @@ impl App {
             gain,
             agc: false,
             antenna,
+            rx_channel: 0,
             bias_tee: false,
             audio: AudioSettings::default(),
             rec: RecordSettings::default(),
@@ -267,6 +272,7 @@ impl App {
             rec_status: None,
             traffic_alert: true,
             tmc_names: HashMap::new(),
+            tmc_locations: crate::tmc::LocationNames::new(),
             live: Live::default(),
             status: "Starting".into(),
             error: None,
@@ -377,6 +383,10 @@ impl App {
         self.devices.iter().find(|d| d.id == self.device_id)
     }
 
+    pub fn station_key(&self, tuned_khz: u32) -> u32 {
+        self.live.station_aliases.get(&tuned_khz).copied().unwrap_or(tuned_khz)
+    }
+
     pub fn stations_json(&self) -> Value {
         Value::Array(self.stations.values().map(|s| s.to_json()).collect())
     }
@@ -390,6 +400,7 @@ impl App {
             "center_mhz": self.center_hz / 1e6,
             "gain": self.gain,
             "antenna": self.antenna,
+            "rx_channel": self.rx_channel,
             "sweeps": self.sweeps,
             "clip": self.clip,
             "uptime_s": self.started.elapsed().as_secs(),
@@ -427,6 +438,7 @@ impl App {
             "band": self.band.key(),
             "band_freq": self.band_freq.iter().map(|(b, f)| (b.key().to_string(), json!(f))).collect::<serde_json::Map<_, _>>(),
             "gain": self.gain, "agc": self.agc, "antenna": self.antenna, "bias_tee": self.bias_tee,
+            "rx_channel": self.rx_channel,
             "traffic_alert": self.traffic_alert,
             "audio": {
                 "output": a.output, "volume": a.volume, "muted": a.muted,
@@ -477,6 +489,7 @@ impl App {
         self.gain = f("gain").unwrap_or(self.gain);
         self.agc = b("agc").unwrap_or(self.agc);
         self.antenna = s("antenna").unwrap_or(self.antenna.clone());
+        self.rx_channel = v.get("rx_channel").and_then(Value::as_u64).filter(|&n| n <= 1).unwrap_or(0) as usize;
         self.bias_tee = b("bias_tee").unwrap_or(false);
         self.traffic_alert = b("traffic_alert").unwrap_or(true);
         if let Some(a) = v.get("audio") {

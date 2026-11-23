@@ -202,7 +202,7 @@ pub struct Station {
     long_ps_mask: u8,
     pub long_ps: Option<String>,
     pub eon: BTreeMap<u16, Eon>,
-    tmc_group: Option<u8>,
+    tmc_group: Option<(u16, u8)>,
     pub tmc: Tmc,
     pub raw: VecDeque<RawGroup>,
     pub group_counts: BTreeMap<String, u64>,
@@ -301,6 +301,10 @@ impl Station {
 
     pub fn has_rds(&self) -> bool {
         self.groups_total > 0
+    }
+
+    pub fn tmc_service_pi(&self) -> Option<u16> {
+        self.tmc_group.map(|(pi, _)| pi)
     }
 
     /// Traffic programme currently broadcasting a traffic announcement.
@@ -617,12 +621,22 @@ impl Station {
                                 self.ert_utf8 = c & 1 == 1;
                             }
                             AID_RTPLUS => self.rtplus_group = Some((app >> 1, app & 1 == 1)),
-                            a if AID_TMC.contains(&a) => self.tmc_group = Some(app >> 1),
                             _ => {}
                         }
                     }
-                    if AID_TMC.contains(&d) {
-                        self.tmc.on_3a_message(c);
+                    if let Some(pi) = g.blocks[0].filter(|_| !g.corrected.iter().any(|&corrected| corrected)) {
+                        if AID_TMC.contains(&d) {
+                            if self.tmc_group.is_some_and(|(old_pi, _)| old_pi != pi) {
+                                self.tmc = Tmc::default();
+                                self.tmc_group = None;
+                            }
+                            if app != 0 {
+                                self.tmc_group = (app & 1 == 0).then_some((pi, app >> 1));
+                            }
+                            self.tmc.on_3a_message(c);
+                        } else if app != 0 && app & 1 == 0 && self.tmc_group == Some((pi, app >> 1)) {
+                            self.tmc_group = None;
+                        }
                     }
                 }
             }
@@ -671,7 +685,7 @@ impl Station {
             if self.rtplus_group == Some((gtype, false)) {
                 self.apply_rtplus(b, c, d, &mut ev);
             }
-            if self.tmc_group == Some(gtype) {
+            if !g.corrected[0] && g.blocks[0].is_some_and(|pi| self.tmc_group == Some((pi, gtype))) {
                 if let Some(e) = self.tmc.on_group(b, c, d) {
                     ev.push(e);
                 }
@@ -734,13 +748,7 @@ impl Station {
                 "pi": format!("{pi:04X}"), "ps": e.ps(), "tp": e.tp, "ta": e.ta, "pty": e.pty,
                 "af": e.af.iter().map(|&a| a as f64 / 10.0).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
-            "tmc": {
-                "ltn": self.tmc.system.ltn, "sid": self.tmc.system.sid,
-                "messages": self.tmc.messages.iter().map(|m| json!({
-                    "event": m.event, "location": m.location, "direction": if m.direction_neg { "-" } else { "+" },
-                    "extent": m.extent, "dp": m.dp, "count": m.count,
-                })).collect::<Vec<_>>(),
-            },
+            "tmc": self.tmc.to_json(),
             "group_counts": self.group_counts,
             "level_db": self.level_db,
             "pilot_db": self.pilot_db,
@@ -763,6 +771,31 @@ mod tests {
 
     fn group(b: u16, c: u16, d: u16) -> Group {
         Group { blocks: [Some(0x2A93), Some(b), Some(c), Some(d)], ..Default::default() }
+    }
+
+    #[test]
+    fn tmc_requires_a_matching_oda_and_clear_location_table() {
+        let mut st = Station::new(102_500);
+        let user = group(0x8008, 101, 12345);
+        for app in [None, Some(17), Some(16)] {
+            if let Some(code) = app {
+                st.apply_group(&group(0x3000 | code, 0, 0xCD46));
+            }
+            for _ in 0..2 {
+                st.apply_group(&user);
+            }
+            assert!(st.tmc.messages.is_empty());
+        }
+        let announce = group(0x3010, 17 << 6, 0xCD46);
+        st.apply_group(&announce);
+        let mut other_pi = user.clone();
+        other_pi.blocks[0] = Some(0x2C64);
+        st.apply_group(&other_pi);
+        st.apply_group(&other_pi);
+        assert!(st.tmc.messages.is_empty());
+        assert!(st.apply_group(&user).is_empty());
+        assert!(st.apply_group(&user)[0].starts_with("TMC event 101"));
+        assert_eq!(st.to_json()["tmc"]["messages"][0]["location"], 12345);
     }
 
     #[test]

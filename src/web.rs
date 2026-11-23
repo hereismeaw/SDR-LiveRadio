@@ -103,6 +103,7 @@ fn handle(app: &Arc<Mutex<App>>, req: &Request) -> Resp {
         (Method::Post, "/api/clear") => {
             let mut a = app.lock().unwrap();
             a.stations.clear();
+            a.live.station_aliases.clear();
             a.push_log("Station list cleared");
             ok()
         }

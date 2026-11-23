@@ -1,8 +1,8 @@
 <p align="center"><img src="assets/icon.png" width="96" alt=""></p>
 
-# RDS FM Monitor
+# SDR-LiveRadio
 
-**A software-defined radio app I built for fun.** It started as "can I decode the RDS text from Bangkok FM stations with a cheap B210 clone?" It ended up as a full radio: FM stereo, AM, RDS, traffic info, an equalizer, a recorder and an internet radio server. It's all Rust, with no GNU Radio and no Python, and DSP written from scratch.
+**I built this for fun.** I wanted to see what Bangkok FM stations were sending under the music, so I plugged in a B210 clone and wrote an RDS decoder. Then I wanted to listen in stereo, keep recordings, and stream a few stations to another room. Now it's a Windows SDR radio written in Rust, with the DSP built from scratch.
 
 > ⚠️ Hobby project. It works on my desk (LibreSDR B210mini on USB 2.0, Windows 11, Bangkok). Your mileage, antenna and local regulations may vary. **Receive only.** The app never transmits.
 
@@ -15,7 +15,7 @@
 | 📡 **FM band scan** | Sweeps 87.5–108 MHz and decodes the RDS of every station it finds at the same time |
 | 🎧 **Live radio** | FM stereo (pilot PLL, 50/75 µs de-emphasis), MW / SW / airband AM, with a real-time spectrum |
 | 📝 **RDS, the whole thing** | PI (country/area), PS, RadioText, **RT+** (title/artist), PTY/PTYN, clock, AF, ECC, PIN, DI, Long PS, **EON**, ODA, eRT, BLER stats and raw groups |
-| 🚦 **Traffic** | TP/TA banner during traffic announcements, EON traffic, **RDS-TMC** decoding (one click downloads the event list) |
+| 🚦 **Traffic** | TP/TA and EON, plus **RDS-TMC ALERT-C** reception, Bangkok station shortcuts and location name import |
 | 🎚️ **Audio** | 10-band EQ with presets, output device selection, auto stereo / forced mono |
 | ✨ **"Make it sound like a CD"** | **AI noise reduction** (RNNoise neural net), bandwidth extension (harmonic exciter above the 15 kHz FM cut-off) and stereo width. Physics still applies: this adds plausible detail, it can't recover what was never broadcast. |
 | ⏺️ **Recording** | WAV (16/24/32f), FLAC, MP3 (with ID3 tags taken from RDS), AAC-LC/HE, up to 96 kHz |
@@ -31,6 +31,8 @@
 | FM scan | 4.56 MS/s, 4 MHz per hop | 2.28 MS/s, 2 MHz per hop |
 | Multi-station streaming | ≈ ±1.8 MHz around the tuned station | ≈ ±0.85 MHz |
 
+The LibreSDR B210mini reports **two simultaneous receive chains** in UHD. Each chain lets you select **TX/RX** or **RX2**, for four physical port choices in total. The app captures one chain at a time. Choose **RX 0** or **RX 1** in the toolbar, then choose the port your antenna is connected to. The other chain could be used for antenna diversity or a side-by-side signal and RDS error-rate comparison. The two chains share the receive LO, and both streams would count toward the USB bandwidth budget. [Ettus B2x0 hardware notes](https://files.ettus.com/manual_archive/v4.5.0.0/html/page_usrp_b200.html)
+
 Lessons learned the hard way:
 - **UHD 4.11 compares serial numbers as hex.** My clone shipped with serial `OVXI4WE`, so it was never found when the serial was given (SDRangel always gives one). The fix is to burn a hex serial: `usrp_burn_mb_eeprom --args type=b200 --values serial=B210A1C`.
 - USB 2.0 tops out at ~8 MS/s sc16, so everything here is designed to stay at or below 4.56 MS/s.
@@ -43,6 +45,7 @@ cargo build --release
 target\release\rds-fm-gui.exe            # the app
 target\release\rds-fm-gui.exe tune 97.0  # start on a station
 target\release\rds-fm.exe devices        # list SDRs
+target\release\rds-fm.exe tune 102.5 --device uhd --rx-channel 1 --antenna RX2
 target\release\rds-fm.exe tune 97.0 --stream 0.0.0.0:8000 --also 95.5,98.5   # headless, 3 streams
 target\release\rds-fm.exe selftest       # synthetic-signal self test, no hardware needed
 target\release\rds-fm.exe tmc-download   # fetch the RDS-TMC event list
@@ -51,6 +54,14 @@ target\release\rds-fm.exe tmc-download   # fetch the RDS-TMC event list
 Needs Rust (MSVC) on Windows. The encoders (LAME, FDK-AAC) are compiled from source by their crates. Close SDRangel first, because only one program can own the SDR. Settings, logbook and TMC data live in `%APPDATA%\rds-fm`.
 
 Streams are at `http://<your-pc>:8000/` (player page), `/fm9700` (97.00 MHz), `/am891` (891 kHz). They work in browsers, VLC, foobar2000, Winamp and so on. To reach listeners outside your network, forward the port on your router or push to an Icecast server.
+
+## RDS-TMC in Bangkok
+
+Open **Traffic** and try **102.50 MHz** or **88.50 MHz**, the frequencies documented by iTIC. Tune to the FM carrier. RDS rides on the 57 kHz subcarrier and is extracted from the station's FM multiplex. These are listening shortcuts, with reception subject to what each station is transmitting. [iTIC Bangkok service](https://iticfoundation.org/en/about-us/how-does-itic-work/) · [iTIC FM multiplex diagram](https://org.iticfoundation.org/th/projects/realtime)
+
+The receiver uses the station's 3A announcement to identify the ALERT-C data groups and the location table. Matching copies confirm each group. Single-group events and complete multi-group messages appear in **Traffic**. The extra multi-group payload is available as raw hex; encrypted services show their status. The CLI also exposes group counts and messages through `/api/state`. [ISO 14819-1](https://www.iso.org/standard/76781.html)
+
+Use **Download event list** to resolve event codes. To resolve single-group location codes, use a matching iTIC table and import a normalized UTF-8 file under **Location CSV**, or keep it as `%APPDATA%\rds-fm\tmc_locations.csv` for automatic loading. Use the header `pi;ltn;location;name`, with PI in hexadecimal and LTN and location in decimal. The table is supplied separately by iTIC. Location codes are shown numerically until a matching entry is available. [iTIC Location Table](https://iticfoundation.org/location-table/) · [OTP ITS overview, p. 24](https://www.otp.go.th/uploads/files/1503313567-s2h8d-6s9lv.pdf#page=24) · [NBTC Spectrum Outlook, p. 59](https://www.nbtc.go.th/downloadfile/%E0%B8%A3%E0%B8%B2%E0%B8%A2%E0%B8%87%E0%B8%B2%E0%B8%99%E0%B9%82%E0%B8%84%E0%B8%A3%E0%B8%87%E0%B8%81%E0%B8%B2%E0%B8%A3-Spectrum-Outlook.pdf?mediaId=553765#page=59)
 
 ## How it works (the fun part)
 

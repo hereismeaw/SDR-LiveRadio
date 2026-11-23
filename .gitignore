@@ -3,3 +3,4 @@
 stations.json
 *.part.wav
 tmc_events.csv
+tmc_locations.csv

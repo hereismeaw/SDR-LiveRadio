@@ -24,6 +24,7 @@ Options:
   --device uhd|rtl   which SDR to use (default: last used / first found)
   --gain <dB>        RX gain (default 30); --agc for automatic gain (RTL-SDR)
   --antenna <name>   TX/RX or RX2 (UHD only, default TX/RX)
+  --rx-channel <n>  UHD receive channel 0 or 1 (default 0 on a new install)
   --port <n>         web UI port (default 8765)
   --no-open          do not open the browser
   --uhd-dll <path>   path to uhd.dll
@@ -45,6 +46,7 @@ fn main() {
     let mut gain: Option<f64> = None;
     let mut agc = false;
     let mut antenna: Option<String> = None;
+    let mut rx_channel: Option<usize> = None;
     let mut want_dev: Option<String> = None;
     let mut port: u16 = 8765;
     let mut open_browser = true;
@@ -65,6 +67,10 @@ fn main() {
             "--gain" => gain = Some(val("--gain").parse().unwrap_or_else(|_| die("invalid --gain"))),
             "--agc" => agc = true,
             "--antenna" => antenna = Some(val("--antenna")),
+            "--rx-channel" => {
+                let n = val("--rx-channel").parse::<usize>().ok().filter(|&n| n <= 1);
+                rx_channel = Some(n.unwrap_or_else(|| die("--rx-channel must be 0 or 1")));
+            }
             "--device" => want_dev = Some(val("--device")),
             "--port" => port = val("--port").parse().unwrap_or_else(|_| die("invalid --port")),
             "--uhd-dll" => paths.uhd_dll = PathBuf::from(val("--uhd-dll")),
@@ -133,6 +139,9 @@ fn main() {
 
     let mut a = App::new(mode, 30.0, "TX/RX".into());
     a.load_settings_file();
+    if let Some(channel) = rx_channel {
+        a.rx_channel = channel;
+    }
     if let Some(g) = gain {
         a.gain = g;
     }

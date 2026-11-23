@@ -14,7 +14,7 @@ use rds_fm::device::{DriverPaths, Kind};
 use rds_fm::record::Format;
 use rds_fm::station::{oda_name, pi_info, rtplus_name, Station, PTY_NAMES};
 use rds_fm::text;
-use rds_fm::tmc::dp_text;
+use rds_fm::tmc::{dp_text, load_location_names, BANGKOK_STATIONS};
 use rds_fm::worker::{self, WorkerCfg};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -49,6 +49,8 @@ struct Gui {
     tab: Tab,
     audio_devices: Vec<String>,
     tmc_csv: String,
+    tmc_location_csv: String,
+    tmc_location_error: Option<String>,
     tmc_job: Arc<Mutex<Option<String>>>,
     vu: [f32; 2],
     last_frame: Instant,
@@ -138,6 +140,8 @@ impl Gui {
             tab: Tab::Station,
             audio_devices: output_devices(),
             tmc_csv: rds_fm::tmc::default_event_csv().display().to_string(),
+            tmc_location_csv: App::data_dir().join("tmc_locations.csv").display().to_string(),
+            tmc_location_error: None,
             tmc_job: Arc::new(Mutex::new(None)),
             vu: [0.0; 2],
             last_frame: Instant::now(),
@@ -339,7 +343,8 @@ impl Gui {
                     }));
                 }
                 ui.monospace(fmt_freq(s.freq_hz));
-                let ps = a.stations.get(&((s.freq_hz / 1e3).round() as u32)).map(|x| x.ps_display().0).unwrap_or_default();
+                let key = a.station_key((s.freq_hz / 1e3).round() as u32);
+                let ps = a.stations.get(&key).map(|x| x.ps_display().0).unwrap_or_default();
                 ui.monospace(ps);
                 if ui.small_button("✕").clicked() {
                     del = Some(i);
@@ -363,10 +368,12 @@ impl Gui {
                 }));
             }
             if let Mode::Listen { hz, .. } = a.mode {
+                let playing = a.station_key((hz as f64 / 1e3).round() as u32);
                 let near: Vec<f64> = a
                     .stations
                     .values()
-                    .filter(|s| s.has_rds() && (s.freq_khz as f64 * 1e3 - hz as f64).abs() < 1.75e6 && s.freq_khz as u64 * 1000 != hz)
+                    .filter(|s| s.has_rds() && (s.freq_khz as f64 * 1e3 - hz as f64).abs() < 1.75e6
+                        && s.freq_khz != playing && s.freq_khz as u64 * 1000 != hz)
                     .map(|s| s.freq_khz as f64 * 1e3)
                     .collect();
                 if !near.is_empty() && ui.button(format!("➕ Add {} RDS stations nearby", near.len())).clicked() {
@@ -446,7 +453,7 @@ impl Gui {
     fn presets_tab(&mut self, ui: &mut egui::Ui, a: &App, ed: &mut Vec<Edit>) {
         ui.horizontal(|ui| {
             let f = self.selected.map(|k| k as f64 * 1e3).unwrap_or(self.freq_ui);
-            let name = a.stations.get(&((f / 1e3).round() as u32)).map(|s| s.ps_display().0.trim().to_string()).unwrap_or_default();
+            let name = a.stations.get(&a.station_key((f / 1e3).round() as u32)).map(|s| s.ps_display().0.trim().to_string()).unwrap_or_default();
             if ui.button(format!("★ Save {}", fmt_freq(f))).clicked() {
                 ed.push(Box::new(move |a| a.add_preset(&name, f)));
             }
@@ -757,6 +764,17 @@ impl Gui {
                     }));
                 }
             } else {
+                let mut rx = a.rx_channel;
+                egui::ComboBox::from_id_salt("rx_channel").selected_text(format!("RX {rx}")).width(55.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut rx, 0, "RX 0");
+                    ui.selectable_value(&mut rx, 1, "RX 1");
+                }).response.on_hover_text("Select the UHD receive channel. RX 1 requires a dual-channel device.");
+                if rx != a.rx_channel {
+                    ed.push(Box::new(move |a| {
+                        a.rx_channel = rx;
+                        a.settings_dirty = true;
+                    }));
+                }
                 let mut ant = a.antenna.clone();
                 egui::ComboBox::from_id_salt("antenna").selected_text(ant.clone()).width(70.0).show_ui(ui, |ui| {
                     ui.selectable_value(&mut ant, "TX/RX".to_string(), "TX/RX");
@@ -780,7 +798,7 @@ impl Gui {
 
     fn now_playing(&mut self, ui: &mut egui::Ui, a: &App) {
         let Mode::Listen { hz, demod } = a.mode else { return };
-        let st = a.stations.get(&((hz / 1000) as u32));
+        let st = a.stations.get(&a.station_key((hz as f64 / 1e3).round() as u32));
         let dt = self.last_frame.elapsed().as_secs_f32();
         for i in 0..2 {
             let p = a.live.peak[i];
@@ -967,7 +985,7 @@ impl Gui {
                 continue;
             }
             let x = x_of(f);
-            let sel = self.selected == Some(s.freq_khz);
+            let sel = self.selected.map(|k| a.station_key(k)) == Some(s.freq_khz);
             let color = if s.has_rds() { GOOD } else { weak };
             if live.is_none() {
                 painter.line_segment([pos2(x, plot.top()), pos2(x, plot.bottom())], Stroke::new(if sel { 2.0 } else { 1.0 }, color.gamma_multiply(0.6)));
@@ -1052,7 +1070,7 @@ impl Gui {
         let selected = &mut self.selected;
         let freq_ui = &mut self.freq_ui;
         let playing = match a.mode {
-            Mode::Listen { hz, .. } => Some((hz / 1000) as u32),
+            Mode::Listen { hz, .. } => Some(a.station_key((hz as f64 / 1e3).round() as u32)),
             _ => None,
         };
         TableBuilder::new(ui)
@@ -1077,7 +1095,7 @@ impl Gui {
             .body(|mut body| {
                 for s in rows {
                     body.row(26.0, |mut row| {
-                        row.set_selected(*selected == Some(s.freq_khz));
+                        row.set_selected(selected.map(|k| a.station_key(k)) == Some(s.freq_khz));
                         let dim = !s.has_rds();
                         row.col(|ui| {
                             let mut t = RichText::new(format!("{:.2}", s.freq_khz as f64 / 1000.0)).monospace().strong();
@@ -1135,7 +1153,7 @@ impl Gui {
     // ------------------------------------------------------------------ tabs
 
     fn station_tab(&mut self, ui: &mut egui::Ui, a: &App, ed: &mut Vec<Edit>) {
-        let Some(s) = self.selected.and_then(|k| a.stations.get(&k)) else {
+        let Some(s) = self.selected.and_then(|k| a.stations.get(&a.station_key(k))) else {
             ui.weak("Click a station in the table or on the spectrum.\nDouble-click to listen.");
             return;
         };
@@ -1228,7 +1246,7 @@ impl Gui {
     }
 
     fn rdsplus_tab(&mut self, ui: &mut egui::Ui, a: &App) {
-        let Some(s) = self.selected.and_then(|k| a.stations.get(&k)) else {
+        let Some(s) = self.selected.and_then(|k| a.stations.get(&a.station_key(k))) else {
             ui.weak("Select a station.");
             return;
         };
@@ -1344,9 +1362,22 @@ impl Gui {
         }
         ui.separator();
         ui.strong("RDS-TMC");
-        let tmc: Vec<&Station> = a.stations.values().filter(|s| s.tmc.groups > 0 || s.tmc.system.ltn.is_some()).collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Bangkok");
+            for (khz, station) in BANGKOK_STATIONS {
+                let hz = f64::from(khz) * 1000.0;
+                let receiving = matches!(a.mode, Mode::Listen { hz: f, .. } if f == u64::from(khz) * 1000);
+                if ui.add(egui::Button::new(fmt_freq(hz)).selected(receiving)).on_hover_text(station).clicked() {
+                    self.selected = Some(khz);
+                    self.freq_ui = hz;
+                    ed.push(Box::new(move |a| a.listen(hz)));
+                }
+            }
+            ui.hyperlink_to("iTIC", "https://iticfoundation.org/en/about-us/how-does-itic-work/");
+        });
+        let tmc: Vec<&Station> = a.stations.values().filter(|s| s.tmc_service_pi().is_some() || s.tmc.groups > 0).collect();
         if tmc.is_empty() {
-            ui.weak("No TMC service decoded yet. TMC is carried in ODA group 8A, announced in 3A (AID CD46/CD47).");
+            ui.weak("Waiting for an ALERT-C service announcement (ODA 3A, AID CD46/CD47).");
         }
         for s in tmc {
             let sys = &s.tmc.system;
@@ -1360,6 +1391,14 @@ impl Gui {
                 s.tmc.groups,
                 s.tmc.tuning_groups
             ));
+            if s.tmc.messages.is_empty() {
+                let status = match sys.ltn {
+                    Some(0) => "This service uses encrypted location codes.",
+                    None => "Waiting for the location table number from the station.",
+                    Some(_) => "Waiting for repeated ALERT-C messages.",
+                };
+                ui.weak(status);
+            }
             egui::ScrollArea::vertical().id_salt(("tmc", s.freq_khz)).max_height(220.0).show(ui, |ui| {
                 egui::Grid::new(("tmcg", s.freq_khz)).num_columns(6).striped(true).show(ui, |ui| {
                     for h in ["Event", "Location", "Dir", "Ext", "Duration", "Seen"] {
@@ -1369,10 +1408,21 @@ impl Gui {
                     for m in s.tmc.messages.iter().rev() {
                         let name = a.tmc_names.get(&m.event).cloned().unwrap_or_default();
                         ui.label(format!("{}{}", m.event, if name.is_empty() { String::new() } else { format!(" {name}") }));
-                        ui.monospace(m.location.to_string());
+                        let location_name = s.tmc_service_pi().filter(|_| !m.multi_group)
+                            .and_then(|pi| a.tmc_locations.get(&(pi, m.ltn, m.location)));
+                        if let Some(name) = location_name {
+                            ui.label(name).on_hover_text(format!("LTN {} · code {}", m.ltn, m.location));
+                        } else {
+                            ui.monospace(m.location.to_string()).on_hover_text(format!("LTN {}", m.ltn));
+                        }
                         ui.label(if m.direction_neg { "−" } else { "+" });
                         ui.label(m.extent.to_string());
-                        ui.label(m.dp.map(dp_text).unwrap_or(if m.multi_group { "multi-group" } else { "" }));
+                        if m.multi_group {
+                            let words = m.optional_words.iter().map(|w| format!("{w:07X}")).collect::<Vec<_>>();
+                            ui.label("Multi-group").on_hover_text(words.join(" "));
+                        } else {
+                            ui.label(m.dp.map(dp_text).unwrap_or_default());
+                        }
                         ui.label(format!("{}× {}", m.count, fmt_age(m.last_seen.elapsed().as_secs_f32())));
                         ui.end_row();
                     }
@@ -1407,7 +1457,7 @@ impl Gui {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("CSV");
+            ui.label("Event CSV");
             ui.text_edit_singleline(&mut self.tmc_csv);
             if ui.button("Load").clicked() {
                 let p = PathBuf::from(self.tmc_csv.clone());
@@ -1418,10 +1468,30 @@ impl Gui {
                 }));
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Location CSV");
+            ui.text_edit_singleline(&mut self.tmc_location_csv).on_hover_text("UTF-8 · pi;ltn;location;name");
+            if ui.button("Load").clicked() {
+                match load_location_names(&PathBuf::from(&self.tmc_location_csv)) {
+                    Ok(names) => {
+                        self.tmc_location_error = None;
+                        ed.push(Box::new(move |a| a.tmc_locations = names));
+                    }
+                    Err(e) => self.tmc_location_error = Some(e),
+                }
+            }
+        });
+        if let Some(error) = &self.tmc_location_error {
+            ui.colored_label(BAD, error);
+        }
+        ui.horizontal(|ui| {
+            ui.weak(format!("{} location names loaded", a.tmc_locations.len()));
+            ui.hyperlink_to("Thailand Location Table", "https://iticfoundation.org/location-table/");
+        });
         ui.label(
             RichText::new(
-                "The download is the ISO 14819-2 event list from GNU Radio gr-rds (GPL-2.0+), kept on this PC only. \
-                 Location names need the national location table, which Thailand has not published.",
+                "The event list comes from GNU Radio gr-rds (GPL-2.0+) and stays on this PC. \
+                 Import a matching Location CSV to show names for single-group messages.",
             )
             .small()
             .weak(),
@@ -1885,6 +1955,13 @@ fn main() -> eframe::Result {
     let mut a = App::new(Mode::Scan, 50.0, "TX/RX".into());
     a.load_settings_file();
     a.load_logbook();
+    let locations = App::data_dir().join("tmc_locations.csv");
+    if locations.is_file() {
+        match load_location_names(&locations) {
+            Ok(names) => a.tmc_locations = names,
+            Err(e) => a.push_log(format!("Cannot load TMC locations: {e}")),
+        }
+    }
     for p in [
         rds_fm::tmc::default_event_csv(),
         PathBuf::from("tmc_events.csv"),

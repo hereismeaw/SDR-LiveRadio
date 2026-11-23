@@ -86,7 +86,11 @@ pub fn bitstream(groups: &[[u16; 4]]) -> Vec<u8> {
 
 /// FM multiplex at 228 kHz: 1 kHz tone, optional 19 kHz pilot, RDS at 57 kHz.
 pub fn mpx(dsp: &mut Dsp, st: &SynthStation, len: usize, rng: &mut Rng) -> Vec<f32> {
-    let bits = bitstream(&groups(st));
+    mpx_groups(dsp, &groups(st), st.stereo, len, rng)
+}
+
+fn mpx_groups(dsp: &mut Dsp, groups: &[[u16; 4]], stereo: bool, len: usize, rng: &mut Rng) -> Vec<f32> {
+    let bits = bitstream(groups);
     let spbit = (MPX_RATE / RDS_BITRATE).round() as usize; // 192
     let half = spbit / 2;
     let mut base = vec![0f32; len];
@@ -110,7 +114,7 @@ pub fn mpx(dsp: &mut Dsp, st: &SynthStation, len: usize, rng: &mut Rng) -> Vec<f
         .map(|n| {
             let t = n as f64 / MPX_RATE;
             let audio = 0.7 * (TAU * 1000.0 * t).cos();
-            let pilot = if st.stereo { 0.09 * (TAU * 19_000.0 * t).sin() } else { 0.0 };
+            let pilot = if stereo { 0.09 * (TAU * 19_000.0 * t).sin() } else { 0.0 };
             let rds = 0.06 * (base[n] / peak) as f64 * (TAU * 57_000.0 * t + phi0).cos();
             (audio + pilot + rds) as f32
         })
@@ -201,8 +205,14 @@ pub fn selftest() -> Result<String, String> {
     let mut rng = Rng(0x1234_5678_9ABC_DEF0);
     let mut iq: Vec<C32> =
         (0..n).map(|_| C32::new((rng.gauss() * 0.003) as f32, (rng.gauss() * 0.003) as f32)).collect();
-    for s in &stations {
-        let m = mpx(&mut dsp, s, MPX_LEN, &mut rng);
+    for (i, s) in stations.iter().enumerate() {
+        let mut cycle = groups(s);
+        if i == 0 {
+            let pty = u16::from(s.pty) << 5;
+            let event = [s.pi, 0x800B | pty, 101, 12345];
+            cycle.extend([[s.pi, 0x3010 | pty, 17 << 6, 0xCD46], event, event]);
+        }
+        let m = mpx_groups(&mut dsp, &cycle, s.stereo, MPX_LEN, &mut rng);
         fm_add(&mut dsp, &m, d, s.freq_hz - center + s.freq_err_hz, s.amp, &mut iq);
     }
 
@@ -219,7 +229,7 @@ pub fn selftest() -> Result<String, String> {
     if results.len() != stations.len() {
         return Err(format!("{report}FAIL: found {} stations, expected {}", results.len(), stations.len()));
     }
-    for s in &stations {
+    for (i, s) in stations.iter().enumerate() {
         let r = results
             .iter()
             .find(|r| (r.freq_hz - s.freq_hz).abs() < 1.0)
@@ -255,6 +265,9 @@ pub fn selftest() -> Result<String, String> {
         if (s.pty, s.stereo) != (st.pty.unwrap_or(99), r.pilot_db > 15.0) {
             return fail("PTY / pilot");
         }
+        if i == 0 && !st.tmc.messages.iter().any(|m| (m.ltn, m.event, m.location) == (17, 101, 12345)) {
+            return fail("ALERT-C event missing");
+        }
         report += &format!(
             "    PI {:04X}  PS \"{}\"  RT \"{}\" [{}]{}\n",
             s.pi,
@@ -263,6 +276,9 @@ pub fn selftest() -> Result<String, String> {
             text::decode(st.rt.as_ref().unwrap()).1,
             st.ct.as_ref().map(|c| format!("  CT {c}")).unwrap_or_default()
         );
+        if let Some(m) = st.tmc.messages.first() {
+            report += &format!("    TMC event {} at location {} (LTN {})\n", m.event, m.location, m.ltn);
+        }
     }
     report += "Self test: PASS";
     Ok(report)

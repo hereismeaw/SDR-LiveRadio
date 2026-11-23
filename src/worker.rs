@@ -9,11 +9,12 @@ use crate::demod::{AmDemod, FmDiscriminator, StereoDecoder};
 use crate::device::{self, DeviceInfo, DriverPaths, Kind, Sdr};
 use crate::dsp::{self, Dsp, MPX_LEN, MPX_RATE};
 use crate::pipeline::{self, CaptureOutput, StationResult};
-use crate::rds::find_groups;
+use crate::rds::{find_groups, Group};
 use crate::record::{Recorder, Tags};
 use crate::station::Station;
 use crate::stream::Channelizer;
 use num_complex::Complex32 as C32;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, TrySendError};
@@ -53,6 +54,7 @@ fn hint(e: &str) -> String {
 struct Open {
     id: String,
     kind: Kind,
+    rx_channel: usize,
     sdr: Sdr,
     rate: f64,
     gain: Option<Option<f64>>,
@@ -94,7 +96,7 @@ impl Open {
     }
 }
 
-fn merge(app: &Arc<Mutex<App>>, out: CaptureOutput, force: bool) {
+fn merge_scan(app: &Arc<Mutex<App>>, out: CaptureOutput) {
     let mut a = app.lock().unwrap();
     let clip = out.clip;
     a.clip = clip;
@@ -105,47 +107,159 @@ fn merge(app: &Arc<Mutex<App>>, out: CaptureOutput, force: bool) {
     for r in out.stations {
         let mut khz = (r.freq_hz / 1e3).round() as u32;
         // The detected peak can wobble by one 50 kHz grid step between sweeps: reuse a
-        // known station 50 kHz away instead of creating a twin (scan mode only).
-        if !force && !a.stations.contains_key(&khz) {
+        // known station 50 kHz away instead of creating a twin.
+        if !a.stations.contains_key(&khz) {
             if let Some(&k) = [khz - 50, khz + 50].iter().find(|k| a.stations.contains_key(k)) {
                 khz = k;
             }
         }
-        let mhz = khz as f64 / 1000.0;
         // A spectral bump with no stereo pilot, no 57 kHz energy and no RDS groups is
         // noise / interference, not a broadcast station.
         let looks_like_fm = r.pilot_db >= 10.0 || r.rds_snr_db >= 3.0 || !r.groups.is_empty();
-        if !a.stations.contains_key(&khz) && !looks_like_fm && !force {
+        if !a.stations.contains_key(&khz) && !looks_like_fm {
             continue;
         }
-        let mut book: Vec<(String, String)> = Vec::new();
-        if !a.stations.contains_key(&khz) {
-            events.push(format!("{mhz:.2} MHz  new station ({:.0} dBFS)", r.level_db));
-            book.push(("station".into(), format!("new station, {:.0} dBFS, pilot {:.0} dB", r.level_db, r.pilot_db)));
-        }
-        let st = a.stations.entry(khz).or_insert_with(|| Station::new(khz));
-        st.update_metrics(r.level_db, r.pilot_db, r.rds_snr_db, r.stats);
-        for g in &r.groups {
-            for ev in st.apply_group(g) {
-                events.push(format!("{mhz:.2} MHz  {ev}"));
-                let kind = ev.split_whitespace().next().unwrap_or("rds").trim_end_matches(':').to_lowercase();
-                let kind = match kind.as_str() {
-                    "traffic" => "ta".to_string(),
-                    k => k.to_string(),
-                };
-                book.push((kind, ev));
-            }
-        }
-        let pi = st.pi.map(|p| format!(" [PI {p:04X}]")).unwrap_or_default();
-        for (k, t) in book {
-            a.log_event(khz as f64 * 1e3, &k, &format!("{t}{pi}"));
-        }
+        merge_station(&mut a, khz, r, &mut events);
     }
     if clip > 0.001 {
         events.push(format!("Signal too strong (clip {:.2}%) — lower the gain", clip * 100.0));
     }
     for e in events {
         a.push_log(e);
+    }
+}
+
+/// Require a repeated, clean PI with a strict majority before associating nearby frequencies.
+fn listen_pi(groups: &[Group]) -> Option<u16> {
+    let mut counts = BTreeMap::new();
+    let mut total = 0;
+    for g in groups.iter().filter(|g| !g.corrected[0]) {
+        if let Some(pi) = g.blocks[0] {
+            *counts.entry(pi).or_insert(0) += 1;
+            total += 1;
+        }
+    }
+    counts.into_iter().find_map(|(pi, n)| (n >= 2 && n > total / 2).then_some(pi))
+}
+
+fn listen_station_key(a: &App, khz: u32, pi: Option<u16>) -> Option<u32> {
+    let exact = a.stations.get(&khz);
+    let nearby = a.stations.range(khz.saturating_sub(50)..=khz.saturating_add(50));
+    if let Some(pi) = pi {
+        if let Some((&key, _)) = nearby
+            .filter(|(_, st)| st.pi == Some(pi))
+            .min_by_key(|(key, _)| key.abs_diff(khz))
+        {
+            return Some(key);
+        }
+    } else if a.live.station_aliases.contains_key(&khz)
+        || (exact.is_none() && nearby.into_iter().any(|(_, st)| st.pi.is_some()))
+    {
+        // Wait for PI before creating a row next to a known station or updating an alias.
+        return None;
+    }
+    Some(khz)
+}
+
+fn merge_listen(a: &mut App, mut r: StationResult, events: &mut Vec<String>) {
+    let tuned_khz = (r.freq_hz / 1e3).round() as u32;
+    let pi = listen_pi(&r.groups);
+    let Some(khz) = listen_station_key(a, tuned_khz, pi) else { return };
+    if khz == tuned_khz {
+        a.live.station_aliases.remove(&tuned_khz);
+    } else {
+        a.live.station_aliases.insert(tuned_khz, khz);
+        // A previous capture may have created a row before its PI was available.
+        if a.stations.get(&tuned_khz).is_some_and(|st| st.pi.is_none()) {
+            a.stations.remove(&tuned_khz);
+        }
+    }
+    if let Some(pi) = pi {
+        r.groups.retain(|g| g.blocks[0].is_none_or(|p| p == pi));
+    }
+    merge_station(a, khz, r, events);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(pi: u16, corrected: bool) -> Group {
+        Group {
+            blocks: [Some(pi), Some(0xF000), None, None],
+            corrected: [corrected, false, false, false],
+        }
+    }
+
+    #[test]
+    fn off_grid_listen_updates_the_known_station() {
+        let mode = Mode::Listen { hz: 102_550_000, demod: Demod::Wfm };
+        let mut a = App::new(mode, 0.0, String::new());
+        let mut st = Station::new(102_500);
+        st.pi = Some(0x2C64);
+        a.stations.insert(st.freq_khz, st);
+        let mut events = Vec::new();
+        let result = |groups| StationResult {
+            freq_hz: 102_550_000.0,
+            level_db: -42.0,
+            pilot_db: 20.0,
+            rds_snr_db: 10.0,
+            groups,
+            stats: Default::default(),
+        };
+        merge_listen(&mut a, result(vec![group(0x2C64, true); 2]), &mut events);
+        assert_eq!(a.stations.len(), 1);
+        assert_eq!(a.station_key(102_550), 102_550);
+
+        merge_listen(
+            &mut a,
+            result(vec![group(0x2C64, false), group(0x2C64, false), group(0x1234, false)]),
+            &mut events,
+        );
+        merge_listen(&mut a, result(Vec::new()), &mut events);
+        assert_eq!(a.stations.len(), 1);
+        assert_eq!(a.station_key(102_550), 102_500);
+        assert_eq!(a.stations[&102_500].groups_total, 2);
+        assert_eq!(a.mode, mode);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn listen_keeps_distinct_pis_and_matches_only_within_50_khz() {
+        let mut a = App::new(Mode::Idle, 0.0, String::new());
+        let pi = 0x2C64;
+        let mut st = Station::new(102_500);
+        st.pi = Some(pi);
+        a.stations.insert(st.freq_khz, st);
+        assert_eq!(listen_station_key(&a, 102_499, Some(pi)), Some(102_500));
+        assert_eq!(listen_station_key(&a, 102_551, Some(pi)), Some(102_551));
+        assert_eq!(listen_station_key(&a, 102_550, Some(0x1234)), Some(102_550));
+        assert_eq!(listen_station_key(&a, 102_500, None), Some(102_500));
+        assert_eq!(listen_station_key(&a, 102_700, None), Some(102_700));
+        assert_eq!(listen_pi(&[group(pi, false), group(0x1234, false)]), None);
+    }
+}
+
+fn merge_station(a: &mut App, khz: u32, r: StationResult, events: &mut Vec<String>) {
+    let mhz = khz as f64 / 1000.0;
+    let mut book: Vec<(String, String)> = Vec::new();
+    if !a.stations.contains_key(&khz) {
+        events.push(format!("{mhz:.2} MHz  new station ({:.0} dBFS)", r.level_db));
+        book.push(("station".into(), format!("new station, {:.0} dBFS, pilot {:.0} dB", r.level_db, r.pilot_db)));
+    }
+    let st = a.stations.entry(khz).or_insert_with(|| Station::new(khz));
+    st.update_metrics(r.level_db, r.pilot_db, r.rds_snr_db, r.stats);
+    for g in &r.groups {
+        for ev in st.apply_group(g) {
+            events.push(format!("{mhz:.2} MHz  {ev}"));
+            let kind = ev.split_whitespace().next().unwrap_or("rds").trim_end_matches(':').to_lowercase();
+            let kind = if kind == "traffic" { "ta".to_string() } else { kind };
+            book.push((kind, ev));
+        }
+    }
+    let pi = st.pi.map(|p| format!(" [PI {p:04X}]")).unwrap_or_default();
+    for (k, t) in book {
+        a.log_event(khz as f64 * 1e3, &k, &format!("{t}{pi}"));
     }
 }
 
@@ -227,7 +341,7 @@ fn scan_step(dev: &mut Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, chunk: &mut u
     let n = pipeline::capture_len(rate)?;
     let iq = dev.sdr.capture(n, (rate * 0.05) as usize)?;
     let out = pipeline::process_capture(dsp, iq, rate, actual, c - half, c + half)?;
-    merge(app, out, false);
+    merge_scan(app, out);
     *chunk += 1;
     if *chunk % centers.len() == 0 {
         let sweeps = {
@@ -462,6 +576,7 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
     }
 
     // Reader thread owns the device while streaming.
+    let (dev_kind, rx_channel) = (dev.kind, dev.rx_channel);
     let stop = Arc::new(AtomicBool::new(false));
     let ctrl: Arc<Mutex<Option<(Option<f64>, String, bool)>>> = Arc::new(Mutex::new(None));
     let (tx, rx) = sync_channel::<Block>(64);
@@ -521,11 +636,12 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
             Err(RecvTimeoutError::Disconnected) => break Err("device reader stopped".into()),
         };
         // settings snapshot
-        let (mode, dev_id, rescan, audio_set, enh_set, rec_req, restart) = {
+        let (mode, dev_id, reopen, audio_set, enh_set, rec_req, restart) = {
             let mut a = app.lock().unwrap();
             let rec_req = a.rec_request.take();
             let restart = (a.streams.clone(), a.stream.clone()) != session_streams;
-            (a.mode, a.device_id.clone(), a.rescan_devices, a.audio.clone(), a.enhance.clone(), rec_req, restart)
+            let reopen = a.rescan_devices || (dev_kind == Kind::Uhd && a.rx_channel != rx_channel);
+            (a.mode, a.device_id.clone(), reopen, a.audio.clone(), a.enhance.clone(), rec_req, restart)
         };
         // Drag-tuning: a new frequency inside the current capture is just a different
         // FFT slice, so move the channel in place instead of restarting the stream.
@@ -546,9 +662,10 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
                 a.status = format!("Listening {label}");
                 a.live.pilot_locked = false;
                 a.live.stereo_blend = false;
+                a.live.station_aliases.clear();
             }
         }
-        if mode != (Mode::Listen { hz, demod }) || rescan || dev_id != app_open_id(app) || restart {
+        if mode != (Mode::Listen { hz, demod }) || reopen || dev_id != app_open_id(app) || restart {
             break Ok(());
         }
         let snap = dev_ctrl_snapshot(app);
@@ -565,7 +682,7 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
             Some(true) if recorder.is_none() => {
                 let (rec_settings, ps, rt) = {
                     let a = app.lock().unwrap();
-                    let st = a.stations.get(&chans[0].khz);
+                    let st = a.stations.get(&a.station_key(chans[0].khz));
                     (a.rec.clone(), st.map(|s| s.ps_display().0).unwrap_or_default(), st.map(|s| s.rt_display().0).unwrap_or_default())
                 };
                 let name = format!(
@@ -671,6 +788,13 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
         let spec = ch.take_spectrum();
         {
             let mut a = app.lock().unwrap();
+            let mut events = Vec::new();
+            for r in rds_results {
+                merge_listen(&mut a, r, &mut events);
+            }
+            for e in events {
+                a.push_log(e);
+            }
             let main = &chans[0];
             let l = &mut a.live;
             l.pilot_locked = demod == Demod::Wfm && main.stereo.pilot_locked;
@@ -698,7 +822,7 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
                 for c in chans.iter_mut() {
                     if let Some(m) = &c.mount {
                         let lbl = format!("{:.2} MHz", c.freq / 1e6);
-                        let t = now_playing(a.stations.get(&c.khz), if c.main { &label } else { &lbl });
+                        let t = now_playing(a.stations.get(&a.station_key(c.khz)), if c.main { &label } else { &lbl });
                         if t != c.title {
                             hub.set_title(m, &t);
                             c.title = t;
@@ -706,9 +830,6 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
                     }
                 }
             }
-        }
-        for r in rds_results {
-            merge(app, CaptureOutput { stations: vec![r], clip: 0.0, spectrum: vec![] }, true);
         }
         if last_save.elapsed() > Duration::from_secs(30) {
             save_stations(app, &cfg.save_path);
@@ -729,6 +850,7 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
         let mut a = app.lock().unwrap();
         a.rec_status = None;
         a.live.streams.clear();
+        a.live.station_aliases.clear();
     }
     stop.store(true, Ordering::Relaxed);
     drop(rx);
@@ -783,9 +905,9 @@ pub fn run(app: Arc<Mutex<App>>, cfg: WorkerCfg) {
             let found: Vec<String> = a.devices.iter().filter(|d| d.present).map(|d| d.label.clone()).collect();
             a.push_log(if found.is_empty() { "No SDR found".to_string() } else { format!("Found: {}", found.join(", ")) });
         }
-        let (mode, want_id, info, dirty) = {
+        let (mode, want_id, info, dirty, rx_channel) = {
             let a = app.lock().unwrap();
-            (a.mode, a.device_id.clone(), a.selected_device().cloned(), a.settings_dirty)
+            (a.mode, a.device_id.clone(), a.selected_device().cloned(), a.settings_dirty, a.rx_channel)
         };
         if dirty {
             app.lock().unwrap().save_settings();
@@ -799,20 +921,21 @@ pub fn run(app: Arc<Mutex<App>>, cfg: WorkerCfg) {
             std::thread::sleep(Duration::from_millis(200));
             continue;
         }
-        if dev.as_ref().map(|d| d.id != want_id).unwrap_or(true) {
+        if dev.as_ref().is_none_or(|d| d.id != want_id || (d.kind == Kind::Uhd && d.rx_channel != rx_channel)) {
             dev = None;
             let Some(info): Option<DeviceInfo> = info.clone() else {
                 std::thread::sleep(Duration::from_millis(300));
                 continue;
             };
             app.lock().unwrap().status = format!("Opening {}…", info.label);
-            match Sdr::open(&info, &cfg.paths) {
+            match Sdr::open(&info, &cfg.paths, rx_channel) {
                 Ok(sdr) => {
                     let mut a = app.lock().unwrap();
                     a.error = None;
                     a.open_device = Some(info.id.clone());
-                    a.push_log(format!("Opened {}", info.label));
-                    dev = Some(Open { id: info.id.clone(), kind: info.kind, sdr, rate: 0.0, gain: None, antenna: None, bias: None });
+                    let input = if info.kind == Kind::Uhd { format!(" · RX {rx_channel}") } else { String::new() };
+                    a.push_log(format!("Opened {}{input}", info.label));
+                    dev = Some(Open { id: info.id.clone(), kind: info.kind, rx_channel, sdr, rate: 0.0, gain: None, antenna: None, bias: None });
                 }
                 Err(e) => {
                     let msg = hint(&e);

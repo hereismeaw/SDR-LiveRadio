@@ -1,4 +1,4 @@
-# Handover — RDS FM Monitor
+# Handover — SDR-LiveRadio
 
 For the next coding agent picking this up. Read it top to bottom once; after that, the "Invariants" and "Known issues" sections are the ones to keep at hand.
 
@@ -23,7 +23,7 @@ The owner writes in Thai; reply in Thai. The UI and README are English by reques
 
 ```powershell
 cargo build --release
-cargo test --release              # 26 tests, ~3 s, no hardware needed
+cargo test --release              # 31 tests, ~3 s, no hardware needed
 target\release\rds-fm-gui.exe     # GUI. The owner runs it from dist\RDS FM Monitor.exe (a copy)
 target\release\rds-fm.exe --help  # CLI + web UI (http://127.0.0.1:8765), useful for headless hardware tests
 target\release\rds-fm.exe selftest
@@ -79,6 +79,7 @@ Runtime data lives in `%APPDATA%\rds-fm\`: `settings.json` (it includes the Icec
 7. **The GPL TMC event list is never committed.** It is downloaded to `%APPDATA%` on request (`rds-fm tmc-download` or the Traffic tab).
 8. **Station keys are kHz.** In scan mode a detection ±50 kHz from a known station is merged into it.
 9. **Streaming only when a server or Icecast is enabled.** Otherwise no MP3 encoding happens and the "ON AIR" badge stays off.
+10. **One UHD RX chain at a time.** The B210 exposes RX 0 and RX 1, each selectable between TX/RX and RX2. A change to the RX chain reopens UHD. A future two-chain capture must account for the shared receive LO and the aggregate USB sample rate.
 
 ## 5. Environment facts learned the hard way
 
@@ -101,20 +102,24 @@ Runtime data lives in `%APPDATA%\rds-fm\`: `settings.json` (it includes the Icec
 
 ## 6. Known issues / next steps (roughly by value)
 
-1. **Off-grid tuning creates twin stations.** Dragging to e.g. 102.55 creates a station next to 102.50. Merge listen-mode results within ±50 kHz of a known PI-matching station, or key stations by PI when known.
-2. **RTL-SDR V4 is untested**: open, gain table, HF upconverter path (MW/SW), streaming read loop, sample-rate acceptance at 1.14/2.28 MS/s. The owner needs the WinUSB driver (Zadig).
-3. **Git remote and push**: the repo is local only. The owner asked for commits **under their name only — no AI co-author trailers**.
-4. **License is undecided** (README says so). Ask before adding one.
-5. **The web UI (`web/index.html`)** lacks the newer features (bands, audio, streams, presets).
-6. **Thai TMC location table**: none is public, so location codes show as numbers. The event list (1402 events) works.
-7. **Recording**: FLAC keeps the encoded stream in memory until stop (long recordings use RAM), and the last <50 ms of AAC is not flushed.
-8. **Stream settings changes restart the listen session** (by design, to reopen mounts). Live add/remove of channels would be nicer.
-9. **The CLI saves settings only between sessions** (the GUI saves immediately).
-10. **Possible features**: waterfall display, scheduled recording, AF-following, EON-based TA switching, DAB+ (no hardware for it), a proper PI→station-name database for Thailand.
+Off-grid FM listening now associates RDS with a known station within ±50 kHz when repeated clean PI blocks agree. The tuner stays on the requested frequency. The B210 test retuned from 102.50 to 102.55 MHz and received new groups for PI 2C64 under the single 102.50 MHz row.
+
+The Traffic tab has iTIC's Bangkok FM shortcuts (102.50 and 88.50 MHz) and a local location-name import. The ALERT-C receiver pairs repeated data groups from the announced transmitter and assembles multipart payloads. The synthetic FM/RDS self-test verifies one event through the signal chain. On-air testing in Bangkok received ordinary RDS on 102.50 MHz and has yet to confirm an ALERT-C broadcast on either documented frequency.
+
+1. **RTL-SDR V4 is untested**: open, gain table, HF upconverter path (MW/SW), streaming read loop, sample-rate acceptance at 1.14/2.28 MS/s. The owner needs the WinUSB driver (Zadig).
+2. **Dual RX**: try antenna diversity with two antennas, using aligned IQ or switching by pilot quality and RDS block errors.
+3. **License is undecided** (README says so). Ask before adding one.
+4. **The web UI (`web/index.html`)** lacks the newer features (bands, audio, streams, presets).
+5. **Thai TMC location table**: obtain a matching table from iTIC and normalize it for the local location CSV importer. The event list (1402 events) works.
+6. **Recording**: FLAC keeps the encoded stream in memory until stop (long recordings use RAM), and the last <50 ms of AAC is not flushed.
+7. **Stream settings changes restart the listen session** (by design, to reopen mounts). Live add/remove of channels would be nicer.
+8. **The CLI saves settings only between sessions** (the GUI saves immediately).
+9. **Possible features**: waterfall display, scheduled recording, AF-following, EON-based TA switching, DAB+ (no hardware for it), a proper PI→station-name database for Thailand.
 
 ## 7. Git conventions for this repo
 
 - Branch `main`. Author is the owner (global git config); don't change `user.name` or `user.email`.
+- Public remote is [hereismeaw/SDR-LiveRadio](https://github.com/hereismeaw/SDR-LiveRadio).
 - **No `Co-Authored-By` or other AI attribution lines** in commit messages (owner's request).
-- Don't commit `target/`, `dist/`, `stations.json`, `*.part.wav`, `tmc_events.csv`, or anything from `%APPDATA%\rds-fm`.
+- Don't commit `target/`, `dist/`, `stations.json`, `*.part.wav`, `tmc_events.csv`, `tmc_locations.csv`, or anything from `%APPDATA%\rds-fm`.
 - Push only when the owner asks.
