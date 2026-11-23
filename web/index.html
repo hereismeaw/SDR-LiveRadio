@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDS FM Monitor</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1b1f24; --muted: #5d6673; --line: #e2e5ea;
+  --accent: #0b6bcb; --accent-ink: #ffffff; --good: #1a7f37; --warn: #b35900; --bad: #c62828;
+  --chip: #eef1f5; --sel: #e7f0fb; --mono: "Cascadia Mono", Consolas, "Leelawadee UI", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --panel: #171b21; --ink: #e6e9ee; --muted: #9aa4b2; --line: #2a3039;
+    --accent: #4c9be8; --accent-ink: #0b1220; --good: #4cc26a; --warn: #f0a13a; --bad: #ff6b6b;
+    --chip: #222832; --sel: #1d2a3a;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 "Segoe UI", "Leelawadee UI", "Noto Sans Thai", system-ui, sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line);
+  padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.status { color: var(--muted); flex: 1 1 240px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); margin-right: 6px; vertical-align: 1px; }
+.dot.off { background: var(--bad); }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+button, input, select { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 10px; }
+button { cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+input[type=number] { width: 78px; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px; padding: 16px; }
+@media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.panel h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line);
+  display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.error { margin: 16px 16px 0; padding: 10px 14px; border: 1px solid var(--bad); color: var(--bad); border-radius: 8px;
+  white-space: pre-wrap; background: var(--panel); }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--sel); }
+tbody tr.sel { background: var(--sel); box-shadow: inset 3px 0 0 var(--accent); }
+tbody tr.nords { color: var(--muted); }
+.freq { font-family: var(--mono); font-weight: 650; white-space: nowrap; }
+.ps { font-family: var(--mono); font-size: 16px; font-weight: 650; white-space: pre; letter-spacing: .5px; }
+.ps.partial { color: var(--muted); font-weight: 400; }
+.rt { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.chip { display: inline-block; font-size: 11px; padding: 1px 6px; border-radius: 10px; background: var(--chip); color: var(--muted); margin-right: 3px; }
+.chip.on { color: var(--ink); }
+.bar { display: inline-block; width: 60px; height: 6px; background: var(--chip); border-radius: 3px; vertical-align: middle; margin-right: 6px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.empty { padding: 28px 14px; color: var(--muted); text-align: center; }
+.detail { padding: 12px 14px; }
+.detail .big { font-family: var(--mono); font-size: 26px; font-weight: 700; white-space: pre; margin: 2px 0 4px; }
+.detail .rtfull { font-size: 15px; margin: 6px 0 12px; word-break: break-word; }
+dl { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 4px 10px; margin: 0; }
+dt { color: var(--muted); font-size: 12px; padding-top: 1px; }
+dd { margin: 0; word-break: break-word; }
+.mono { font-family: var(--mono); font-size: 12px; }
+.log { font-family: var(--mono); font-size: 12px; max-height: 260px; overflow: auto; padding: 8px 14px; white-space: pre-wrap; color: var(--muted); }
+.side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+label.toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); font-weight: 400; }
+</style>
+</head>
+<body>
+<header>
+  <h1>RDS FM Monitor</h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">Connecting…</span></div>
+  <div class="controls">
+    <button id="btnScan">Scan band</button>
+    <input id="tuneF" type="number" step="0.05" min="87.5" max="108" placeholder="MHz" aria-label="Frequency in MHz">
+    <button id="btnTune" class="primary">Lock</button>
+    <label class="toggle">Gain <input id="gain" type="number" min="0" max="76" step="1"></label>
+    <select id="ant" aria-label="Antenna port"><option>TX/RX</option><option>RX2</option></select>
+    <button id="btnClear" title="Clear the station list">Clear</button>
+  </div>
+</header>
+<div id="err" class="error" hidden></div>
+<main>
+  <section class="panel">
+    <h2><span id="count">Stations</span>
+      <label class="toggle"><input type="checkbox" id="onlyRds" checked> RDS only</label></h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>MHz</th><th>PS</th><th>PTY</th><th>RadioText</th><th>PI</th><th>Signal</th><th>RDS</th><th></th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div id="empty" class="empty">No stations yet — waiting for the first sweep (about 30 s)</div>
+  </section>
+  <div class="side">
+    <section class="panel"><h2>Station details</h2><div id="detail" class="detail"><span style="color:var(--muted)">Click a station in the table to see its details</span></div></section>
+    <section class="panel"><h2>Event log</h2><div id="log" class="log"></div></section>
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+let state = null, sel = null, gainEditing = false;
+try { $("#onlyRds").checked = localStorage.getItem("onlyRds") !== "0"; } catch (e) {}
+
+async function post(url) {
+  try { const r = await fetch(url, { method: "POST" }); const j = await r.json(); if (!j.ok) alert(j.error); } catch (e) { alert(e); }
+  poll(true);
+}
+$("#btnScan").onclick = () => post("/api/scan");
+$("#btnTune").onclick = () => { const f = parseFloat($("#tuneF").value); if (f) post("/api/tune?f=" + f); };
+$("#tuneF").onkeydown = e => { if (e.key === "Enter") $("#btnTune").click(); };
+$("#gain").onfocus = () => gainEditing = true;
+$("#gain").onchange = () => { gainEditing = false; post("/api/gain?g=" + $("#gain").value); };
+$("#gain").onblur = () => gainEditing = false;
+$("#ant").onchange = () => post("/api/antenna?a=" + encodeURIComponent($("#ant").value));
+$("#btnClear").onclick = () => { if (confirm("Clear all stations?")) post("/api/clear"); };
+$("#onlyRds").onchange = () => { try { localStorage.setItem("onlyRds", $("#onlyRds").checked ? "1" : "0"); } catch (e) {} render(); };
+
+const fmtF = f => f.toFixed(2);
+const hasRds = s => s.groups_total > 0;
+function age(sec) { if (sec == null) return "–"; if (sec < 60) return Math.round(sec) + " s"; if (sec < 3600) return Math.round(sec / 60) + " min"; return Math.round(sec / 3600) + " h"; }
+function level(s) { const db = s.level_db; if (db == null) return "–"; const p = Math.max(0, Math.min(100, (db + 90) / 80 * 100));
+  return `<span class="bar"><i style="width:${p}%"></i></span>${db.toFixed(0)} dBFS`; }
+function psCell(s) {
+  if (s.ps) return `<span class="ps">${esc(s.ps.text)}</span>`;
+  if (hasRds(s)) return `<span class="ps partial">${esc(s.ps_partial)}</span>`;
+  return `<span class="ps partial">—</span>`;
+}
+
+function render() {
+  if (!state) return;
+  const only = $("#onlyRds").checked;
+  const list = state.stations.filter(s => !only || hasRds(s));
+  const withRds = state.stations.filter(hasRds).length;
+  $("#count").textContent = `${state.stations.length} stations · ${withRds} with RDS`;
+  $("#empty").hidden = list.length > 0;
+  $("#empty").textContent = state.stations.length ? "No RDS decoded yet (untick \"RDS only\" to see all stations)" : "No stations yet — waiting for the first sweep (about 30 s)";
+  $("#rows").innerHTML = list.map(s => {
+    const stereo = s.pilot_db > 15;
+    return `<tr data-f="${s.freq_mhz}" class="${sel === s.freq_mhz ? "sel" : ""} ${hasRds(s) ? "" : "nords"}">
+      <td class="freq">${fmtF(s.freq_mhz)}</td>
+      <td>${psCell(s)}</td>
+      <td>${esc(s.pty_name ?? "")}</td>
+      <td class="rt" title="${esc(s.rt ? s.rt.text : s.rt_partial)}">${esc(s.rt ? s.rt.text : s.rt_partial)}</td>
+      <td class="num mono">${esc(s.pi ?? "")}</td>
+      <td class="num">${level(s)}</td>
+      <td class="num">${hasRds(s) ? Math.round(s.quality * 100) + "%" : "–"}</td>
+      <td><span class="chip ${stereo ? "on" : ""}">${stereo ? "Stereo" : "Mono"}</span>${s.tp ? '<span class="chip on">TP</span>' : ""}${s.ta ? '<span class="chip on">TA</span>' : ""}</td>
+    </tr>`;
+  }).join("");
+  for (const tr of $("#rows").children) tr.onclick = () => { sel = parseFloat(tr.dataset.f); render(); };
+  renderDetail();
+}
+
+function renderDetail() {
+  const s = state.stations.find(x => x.freq_mhz === sel);
+  if (!s) return;
+  const row = (k, v) => v == null || v === "" ? "" : `<dt>${k}</dt><dd>${v}</dd>`;
+  const gc = Object.entries(s.group_counts || {}).map(([k, v]) => `${k}:${v}`).join("  ");
+  $("#detail").innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+      <div class="freq" style="font-size:18px">${fmtF(s.freq_mhz)} MHz</div>
+      <button class="primary" id="lockThis">Lock this station</button>
+    </div>
+    <div class="big">${esc(s.ps ? s.ps.text : (hasRds(s) ? s.ps_partial : "—"))}</div>
+    <div class="rtfull">${esc(s.rt ? s.rt.text : s.rt_partial) || '<span style="color:var(--muted)">No RadioText yet</span>'}</div>
+    <dl>
+      ${row("PI", s.pi && `<span class="mono">${esc(s.pi)}</span>`)}
+      ${row("PTY", s.pty != null ? `${s.pty} · ${esc(s.pty_name)}` : null)}
+      ${row("PTYN", s.ptyn && esc(s.ptyn.text))}
+      ${row("Clock (CT)", s.ct && esc(s.ct))}
+      ${row("eRT", s.ert && esc(s.ert))}
+      ${row("Charset", [s.ps && "PS " + s.ps.charset, s.rt && "RT " + s.rt.charset].filter(Boolean).join(" · "))}
+      ${row("PS history", s.ps_history.length > 1 ? s.ps_history.map(p => `<span class="chip on mono">${esc(p)}</span>`).join(" ") : null)}
+      ${row("AF", s.af.length ? s.af.map(f => f.toFixed(1)).join(", ") + " MHz" : null)}
+      ${row("ECC", s.ecc && `<span class="mono">${s.ecc}</span>`)}
+      ${row("ODA", s.oda.length ? s.oda.map(o => `${o.aid} ${esc(o.name)} (${esc(o.group)})`).join("<br>") : null)}
+      ${row("Flags", [s.tp ? "TP" : null, s.ta ? "TA" : null, s.music != null ? (s.music ? "Music" : "Speech") : null, s.di_stereo != null ? (s.di_stereo ? "DI: stereo" : "DI: mono") : null].filter(Boolean).join(" · "))}
+      ${row("Level", s.level_db != null ? s.level_db.toFixed(1) + " dBFS" : null)}
+      ${row("Pilot 19 kHz", s.pilot_db != null ? s.pilot_db.toFixed(1) + " dB" : null)}
+      ${row("RDS 57 kHz", s.rds_snr_db != null ? s.rds_snr_db.toFixed(1) + " dB" : null)}
+      ${row("Blocks OK", Math.round(s.quality * 100) + "% (last capture)")}
+      ${row("Groups", `${s.groups_total} total<br><span class="mono">${esc(gc)}</span>`)}
+      ${row("Last seen", age(s.age_s) + " ago" + (s.rds_age_s != null ? ` · RDS ${age(s.rds_age_s)} ago` : ""))}
+      ${row("PS hex", s.ps && `<span class="mono">${s.ps.hex}</span>`)}
+      ${row("RT hex", s.rt && `<span class="mono">${s.rt.hex}</span>`)}
+    </dl>`;
+  $("#lockThis").onclick = () => post("/api/tune?f=" + s.freq_mhz);
+}
+
+let timer = null;
+async function poll(once) {
+  clearTimeout(timer);
+  try {
+    const r = await fetch("/api/state", { cache: "no-store" });
+    state = await r.json();
+    $("#dot").className = "dot" + (state.error ? " off" : "");
+    $("#status").textContent = state.status + (state.clip > 0.001 ? ` · ⚠ clip ${(state.clip * 100).toFixed(2)}%` : "");
+    $("#err").hidden = !state.error; $("#err").textContent = state.error || "";
+    if (!gainEditing && document.activeElement !== $("#gain")) $("#gain").value = state.gain;
+    if (document.activeElement !== $("#ant")) $("#ant").value = state.antenna;
+    const log = $("#log"); const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+    log.textContent = state.log.join("\n"); if (atBottom) log.scrollTop = log.scrollHeight;
+    render();
+  } catch (e) {
+    $("#dot").className = "dot off"; $("#status").textContent = "Lost connection to rds-fm";
+  }
+  if (!once) timer = setTimeout(poll, 1000); else timer = setTimeout(poll, 1000);
+}
+poll();
+</script>
+</body>
+</html>

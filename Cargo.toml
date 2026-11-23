@@ -1,0 +1,35 @@
+[package]
+name = "rds-fm"
+version = "0.1.0"
+edition = "2021"
+description = "FM RDS receiver/decoder for USRP B2xx (UHD C API) with a local web dashboard"
+
+[dependencies]
+rustfft = "6.2"
+num-complex = "0.4"
+serde_json = "1"
+tiny_http = "0.12"
+encoding_rs = "0.8"
+libloading = "0.8"
+eframe = "0.37.0"
+egui_extras = "0.37.0"
+cpal = "0.18.2"
+hound = "3.5.1"
+mp3lame-encoder = "0.3.0"
+fdk-aac = "0.8.0"
+flacenc = "0.5.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+nnnoiseless = "0.5.2"
+ureq = "3.5.2"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+
+[build-dependencies]
+winresource = "0.1.34"
