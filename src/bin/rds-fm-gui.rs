@@ -172,10 +172,11 @@ impl Gui {
         let inside = a
             .capture_window
             .is_some_and(|(wl, wh)| current.is_some() && snapped > wl + 150e3 && snapped < wh - 150e3 && Band::of_freq(current.unwrap()) == band);
+        let auto_rx = a.rx_auto && band == Band::Fm && a.selected_device().is_some_and(|d| d.kind == Kind::Uhd);
         let send = if released {
             current.map(|c| (c - snapped).abs() > 1.0).unwrap_or(true)
         } else {
-            inside && self.drag_sent != Some(snapped) && current.map(|c| (c - snapped).abs() > 1.0).unwrap_or(false)
+            !auto_rx && inside && self.drag_sent != Some(snapped) && current.map(|c| (c - snapped).abs() > 1.0).unwrap_or(false)
         };
         if send {
             self.drag_sent = Some(snapped);
@@ -602,6 +603,13 @@ impl Gui {
             let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 4.5, if a.error.is_some() { BAD } else { GOOD });
             ui.label(&a.status);
+            if let Some(d) = &a.live.dual_rx {
+                ui.label(format!("Using RX {}", d.selected)).on_hover_ui(|ui| {
+                    for i in 0..2 {
+                        ui.label(format!("RX {i} · {:.1} dBFS · {:.1} dB pilot", d.level_db[i], d.pilot_db[i]));
+                    }
+                });
+            }
             if a.clip > 0.001 {
                 ui.colored_label(WARN, format!("⚠ clip {:.2}% — lower the gain", a.clip * 100.0));
             }
@@ -764,27 +772,73 @@ impl Gui {
                     }));
                 }
             } else {
-                let mut rx = a.rx_channel;
-                egui::ComboBox::from_id_salt("rx_channel").selected_text(format!("RX {rx}")).width(55.0).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut rx, 0, "RX 0");
-                    ui.selectable_value(&mut rx, 1, "RX 1");
-                }).response.on_hover_text("Select the UHD receive channel. RX 1 requires a dual-channel device.");
-                if rx != a.rx_channel {
+                let previous = if a.rx_dual { "Dual RX" } else if a.rx_auto { "Auto RX" } else { "Manual RX" };
+                let mut reception = previous;
+                egui::ComboBox::from_id_salt("rx_mode").selected_text(reception).width(82.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut reception, "Manual RX", "Manual RX");
+                    ui.selectable_value(&mut reception, "Auto RX", "Auto RX · compare all ports");
+                    ui.selectable_value(&mut reception, "Dual RX", "Dual RX · two channels at once");
+                });
+                if reception != previous {
                     ed.push(Box::new(move |a| {
-                        a.rx_channel = rx;
+                        a.rx_auto = reception == "Auto RX";
+                        a.rx_dual = reception == "Dual RX";
                         a.settings_dirty = true;
                     }));
                 }
-                let mut ant = a.antenna.clone();
-                egui::ComboBox::from_id_salt("antenna").selected_text(ant.clone()).width(70.0).show_ui(ui, |ui| {
-                    ui.selectable_value(&mut ant, "TX/RX".to_string(), "TX/RX");
-                    ui.selectable_value(&mut ant, "RX2".to_string(), "RX2");
-                });
-                if ant != a.antenna {
-                    ed.push(Box::new(move |a| {
-                        a.antenna = ant;
-                        a.settings_dirty = true;
-                    }));
+                let dual = a.rx_dual && a.band == Band::Fm;
+                let automatic = !dual && a.rx_auto && matches!(a.mode, Mode::Listen { demod: Demod::Wfm, .. });
+                if !automatic {
+                    if !dual {
+                        let mut rx = a.rx_channel;
+                        egui::ComboBox::from_id_salt("rx_channel").selected_text(format!("RX {rx}")).width(55.0).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut rx, 0, "RX 0");
+                            ui.selectable_value(&mut rx, 1, "RX 1");
+                        }).response.on_hover_text("Select the UHD receive channel. RX 1 requires a dual-channel device.");
+                        if rx != a.rx_channel {
+                            ed.push(Box::new(move |a| {
+                                a.rx_channel = rx;
+                                a.settings_dirty = true;
+                            }));
+                        }
+                    }
+                    let mut ant = a.antenna.clone();
+                    let label = if dual { format!("RX 0: {ant}") } else { ant.clone() };
+                    egui::ComboBox::from_id_salt("antenna").selected_text(label).width(70.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut ant, "TX/RX".to_string(), "TX/RX");
+                        ui.selectable_value(&mut ant, "RX2".to_string(), "RX2");
+                    });
+                    if ant != a.antenna {
+                        ed.push(Box::new(move |a| {
+                            a.antenna = ant;
+                            a.settings_dirty = true;
+                        }));
+                    }
+                }
+                if dual {
+                    let mut ant = a.rx1_antenna.clone();
+                    egui::ComboBox::from_id_salt("rx1_antenna").selected_text(format!("RX 1: {ant}")).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut ant, "TX/RX".to_string(), "TX/RX");
+                        ui.selectable_value(&mut ant, "RX2".to_string(), "RX2");
+                    });
+                    if ant != a.rx1_antenna {
+                        ed.push(Box::new(move |a| {
+                            a.rx1_antenna = ant;
+                            a.settings_dirty = true;
+                        }));
+                    }
+                }
+                if let Some(survey) = &a.rx_survey {
+                    let selected = &survey.measurements[survey.selected];
+                    let mut details = vec!["19 kHz pilot SNR · RF contrast".to_owned()];
+                    details.extend(survey.measurements.iter().map(|m| format!(
+                        "RX {} · {}    {:.1} dB · {:.1} dB{}",
+                        m.channel, m.antenna, m.pilot_db, m.contrast_db, if m.clipped { " (clipped)" } else { "" },
+                    )));
+                    ui.label(format!("RX {} · {}", selected.channel, selected.antenna)).on_hover_text(details.join("\n"));
+                    if ui.add_enabled(a.rec_status.is_none(), egui::Button::new("Recheck")).clicked() {
+                        ed.push(Box::new(|a| a.rx_recheck = true));
+                    }
                 }
             }
         });

@@ -1,7 +1,7 @@
 //! Radio worker: owns the SDR, runs FM band scans (burst captures) or a continuous
 //! listen session (audio + RDS), and merges results into `App`.
 
-use crate::app::{App, Band, Demod, LiveStream, Mode, RecStatus};
+use crate::app::{App, Band, Demod, DualRxStatus, LiveStream, Mode, RecStatus, RxMeasurement, RxSurvey};
 use crate::audio::{drift_adjust, AudioOut, Equalizer, Frame, Resampler};
 use crate::broadcast::{mount_name, spawn_icecast, LiveMp3};
 use crate::enhance::Enhancer;
@@ -55,6 +55,7 @@ struct Open {
     id: String,
     kind: Kind,
     rx_channel: usize,
+    dual: bool,
     sdr: Sdr,
     rate: f64,
     gain: Option<Option<f64>>,
@@ -63,6 +64,18 @@ struct Open {
 }
 
 impl Open {
+    fn select_rx_channel(&mut self, channel: usize) -> Result<(), String> {
+        if self.rx_channel != channel {
+            let Sdr::Uhd(u) = &mut self.sdr else { return Err("RX selection requires UHD".into()) };
+            u.select_rx_channel(channel)?;
+            self.rx_channel = channel;
+            self.rate = 0.0;
+            self.gain = None;
+            self.antenna = None;
+        }
+        Ok(())
+    }
+
     fn ensure_rate(&mut self, rate: f64) -> Result<(), String> {
         if self.rate != rate {
             let got = self.sdr.set_rate(rate)?;
@@ -75,11 +88,8 @@ impl Open {
     }
 
     /// Apply gain / antenna / bias-tee from App if they changed.
-    fn apply_controls(&mut self, app: &Arc<Mutex<App>>) -> Result<(), String> {
-        let (g, ant, bias) = {
-            let a = app.lock().unwrap();
-            (if a.agc { None } else { Some(a.gain) }, a.antenna.clone(), a.bias_tee)
-        };
+    fn apply_controls(&mut self, app: &Arc<Mutex<App>>, antenna: Option<&str>) -> Result<(), String> {
+        let (g, ant, bias) = dev_ctrl_snapshot(app, antenna);
         if self.gain != Some(g) {
             self.sdr.set_gain(g)?;
             self.gain = Some(g);
@@ -94,6 +104,69 @@ impl Open {
         }
         Ok(())
     }
+}
+
+fn best_rx(measurements: &[RxMeasurement]) -> Option<usize> {
+    measurements.iter().enumerate().max_by(|(_, a), (_, b)| {
+        let a_stereo = a.pilot_db >= 15.0;
+        let b_stereo = b.pilot_db >= 15.0;
+        (!a.clipped, a_stereo).cmp(&(!b.clipped, b_stereo))
+            .then_with(|| if a_stereo && b_stereo {
+                a.pilot_db.total_cmp(&b.pilot_db)
+            } else {
+                a.contrast_db.total_cmp(&b.contrast_db)
+            })
+            .then_with(|| a.level_db.total_cmp(&b.level_db))
+    }).map(|(index, _)| index)
+}
+
+/// Compare the same FM channel on each available input before opening the live stream.
+fn survey_rx(dev: &mut Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64) -> Result<Option<RxSurvey>, String> {
+    let Sdr::Uhd(u) = &dev.sdr else { return Ok(None) };
+    let channels = u.rx_channels();
+    let mode = Mode::Listen { hz, demod: Demod::Wfm };
+    let freq = hz as f64;
+    let mpx_len = 1 << 16;
+    let iq_len = mpx_len * (LISTEN_RATE / MPX_RATE) as usize;
+    let bin = LISTEN_RATE / iq_len as f64;
+    let mut measurements = Vec::with_capacity(channels * 2);
+    for channel in 0..channels {
+        for antenna in ["TX/RX", "RX2"] {
+            {
+                let mut a = app.lock().unwrap();
+                if a.mode != mode || !a.rx_auto || a.device_id != dev.id || a.rescan_devices {
+                    return Ok(None);
+                }
+                a.status = format!("Checking RX {channel} · {antenna} at {:.2} MHz…", freq / 1e6);
+            }
+            let measurement = (|| -> Result<RxMeasurement, String> {
+                dev.select_rx_channel(channel)?;
+                dev.ensure_rate(LISTEN_RATE)?;
+                dev.apply_controls(app, Some(antenna))?;
+                let lo = dev.sdr.tune(freq + 250e3)?;
+                let mut iq = dev.sdr.capture(iq_len, (LISTEN_RATE * 0.05) as usize)?;
+                let clipped = pipeline::clip_fraction(&iq) > 0.001;
+                dsp.fft(&mut iq);
+                let offset = freq - lo;
+                let level_db = pipeline::level_db(&iq, LISTEN_RATE, offset, 80e3);
+                // Compare equal-width bands just outside the FM channel, away from DC.
+                let left = pipeline::level_db(&iq, LISTEN_RATE, offset - 140e3, 25e3);
+                let right = pipeline::level_db(&iq, LISTEN_RATE, offset + 140e3, 25e3);
+                let contrast_db = level_db - left.min(right) - 10.0 * (160.0f32 / 50.0).log10();
+                let base = dsp.extract(&iq, (offset / bin).round() as i64, mpx_len, bin, 100e3, 114e3);
+                let pilot_db = dsp.fm_pilot_snr(&dsp::fm_demod(&base));
+                Ok(RxMeasurement { channel, antenna, level_db, pilot_db, contrast_db, clipped })
+            })();
+            match measurement {
+                Ok(m) => measurements.push(m),
+                Err(e) => app.lock().unwrap().push_log(format!("RX {channel} {antenna} check failed: {e}")),
+            }
+        }
+    }
+    let selected = best_rx(&measurements).ok_or("No UHD antenna input could be sampled")?;
+    let winner = &measurements[selected];
+    dev.select_rx_channel(winner.channel)?;
+    Ok(Some(RxSurvey { measurements, selected }))
 }
 
 fn merge_scan(app: &Arc<Mutex<App>>, out: CaptureOutput) {
@@ -183,6 +256,42 @@ fn merge_listen(a: &mut App, mut r: StationResult, events: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dual_rx_switches_after_sustained_advantage() {
+        let mut d = Diversity::default();
+        let level = [-40.0, -40.0];
+        d.update([19.0, 24.0], [-25.0, -34.0], level);
+        assert_eq!(d.active, 1);
+        d.update([30.0, 24.0], [-35.0, -34.0], level);
+        assert_eq!(d.active, 1);
+        d.update([25.0, 24.0], [-35.0, -34.0], level);
+        d.update([30.0, 24.0], [-35.0, -34.0], level);
+        assert_eq!(d.active, 1);
+        d.update([30.0, 24.0], [-35.0, -34.0], level);
+        assert_eq!(d.active, 0);
+        let (rate, _, _, _) = plan_session(Kind::Uhd, 97e6, Demod::Wfm, &[97.5e6], true);
+        assert_eq!(rate, 2.28e6);
+    }
+
+    #[test]
+    fn auto_rx_prefers_clean_pilot_and_uses_rf_contrast_for_mono() {
+        let measurement = |channel, antenna, pilot_db, contrast_db, clipped| RxMeasurement {
+            channel, antenna, level_db: -45.0, pilot_db, contrast_db, clipped,
+        };
+        let mut inputs = [
+            measurement(0, "TX/RX", 37.0, 38.0, true),
+            measurement(0, "RX2", 27.0, 20.0, false),
+            measurement(1, "TX/RX", 31.0, 18.0, false),
+            measurement(1, "RX2", 5.0, 31.0, false),
+        ];
+        assert_eq!(best_rx(&inputs), Some(2));
+        for input in &mut inputs {
+            input.pilot_db = 4.0;
+        }
+        assert_eq!(best_rx(&inputs), Some(3));
+        assert_eq!(best_rx(&[]), None);
+    }
 
     fn group(pi: u16, corrected: bool) -> Group {
         Group {
@@ -356,8 +465,54 @@ fn scan_step(dev: &mut Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, chunk: &mut u
 }
 
 enum Block {
-    Data(Vec<C32>),
+    Data(Vec<C32>, Option<Vec<C32>>),
     Err(String),
+}
+
+#[derive(Default)]
+struct Diversity {
+    active: usize,
+    initialized: bool,
+    better_blocks: u8,
+}
+
+impl Diversity {
+    fn update(&mut self, pilot: [f32; 2], noise: [f32; 2], level: [f32; 2]) {
+        let mut quality = if pilot.iter().any(|&db| db >= 15.0) { pilot } else { noise.map(|db| -db) };
+        for (score, level) in quality.iter_mut().zip(level) {
+            if level < -100.0 {
+                *score = -1000.0;
+            }
+        }
+        if !self.initialized {
+            self.active = usize::from(quality[1] > quality[0]);
+            self.initialized = true;
+            return;
+        }
+        let other = 1 - self.active;
+        if quality[other] > quality[self.active] + 3.0 {
+            self.better_blocks += 1;
+            if self.better_blocks == 2 {
+                self.active = other;
+                self.better_blocks = 0;
+            }
+        } else {
+            self.better_blocks = 0;
+        }
+    }
+}
+
+fn iq_power(samples: &[C32]) -> f32 {
+    samples.iter().map(|v| v.norm_sqr()).sum::<f32>() / samples.len().max(1) as f32
+}
+
+fn fade_to(new: &mut [f32], old: &[f32]) {
+    // Blend a short section of demodulated FM to avoid an arbitrary IQ phase jump.
+    let count = new.len().min(old.len()).min(512);
+    for i in 0..count {
+        let mix = (i + 1) as f32 / count as f32;
+        new[i] = old[i] * (1.0 - mix) + new[i] * mix;
+    }
 }
 
 /// Program audio rate: EQ, enhancer, recorder and stream encoders all run at 48 kHz.
@@ -369,12 +524,14 @@ struct Chan {
     khz: u32,
     main: bool,
     disc: FmDiscriminator,
+    disc_second: FmDiscriminator,
     stereo: StereoDecoder,
     am: AmDemod,
     up: Resampler,
     eq: Equalizer,
     enh: Enhancer,
     rds_acc: Vec<f32>,
+    rds_acc_second: Vec<f32>,
     mount: Option<String>,
     mp3: Option<LiveMp3>,
     title: String,
@@ -388,12 +545,14 @@ impl Chan {
             khz: (freq / 1e3).round() as u32,
             main,
             disc: FmDiscriminator::default(),
+            disc_second: FmDiscriminator::default(),
             stereo: StereoDecoder::new(),
             am: AmDemod::new(),
             up: Resampler::new(audio_rate, PROGRAM_RATE),
             eq: Equalizer::new(PROGRAM_RATE),
             enh: Enhancer::new(cutoff),
             rds_acc: Vec::with_capacity(MPX_LEN * 2),
+            rds_acc_second: Vec::new(),
             mount: None,
             mp3: None,
             title: String::new(),
@@ -404,14 +563,14 @@ impl Chan {
 
 /// Session layout: IQ rate, LO frequency, channel frequencies (main first) and
 /// stream frequencies that could not be included.
-fn plan_session(kind: Kind, main: f64, demod: Demod, extras: &[f64]) -> (f64, f64, Vec<f64>, Vec<f64>) {
+fn plan_session(kind: Kind, main: f64, demod: Demod, extras: &[f64], dual: bool) -> (f64, f64, Vec<f64>, Vec<f64>) {
     let offset = if demod == Demod::Wfm { 250e3 } else { 200e3 };
     if demod == Demod::Am || extras.is_empty() {
         return (LISTEN_RATE, main + offset, vec![main], extras.to_vec());
     }
-    let rate = match kind {
-        Kind::Uhd => MPX_RATE * 20.0,   // 4.56 MS/s: ~3.7 MHz of usable band
-        Kind::RtlSdr => MPX_RATE * 10.0, // 2.28 MS/s: ~1.8 MHz
+    let rate = match (kind, dual) {
+        (Kind::Uhd, false) => MPX_RATE * 20.0,
+        _ => MPX_RATE * 10.0, // Dual RX uses at most 4.56 MS/s total over USB.
     };
     let usable = rate / 2.0 - 140e3;
     let mut sel = vec![main];
@@ -459,13 +618,33 @@ fn now_playing(st: Option<&Station>, label: &str) -> String {
 /// Continuous reception with audio output, recording, RDS and internet streaming.
 /// Extra FM stations from the stream list are demodulated from the same capture when
 /// they fit in the device bandwidth. Returns when mode, frequency or device changes.
-fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demod: Demod, cfg: &WorkerCfg) -> (Open, Result<(), String>) {
+fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demod: Demod, auto_rx: bool, cfg: &WorkerCfg) -> (Open, Result<(), String>) {
     let mut dev = dev;
+    let dual = dev.dual;
     let mut hz = hz;
     let mut f = hz as f64;
-    let (streams, stream_set, enh_set0, am_bw) = {
+    let survey = if auto_rx {
+        match survey_rx(&mut dev, dsp, app, hz) {
+            Ok(Some(survey)) => Some(survey),
+            Ok(None) => return (dev, Ok(())),
+            Err(e) => return (dev, Err(e)),
+        }
+    } else {
+        None
+    };
+    {
         let a = app.lock().unwrap();
-        (a.streams.clone(), a.stream.clone(), a.enhance.clone(), a.audio.am_bw_hz as f64)
+        if a.mode != (Mode::Listen { hz, demod }) || a.device_id != dev.id || a.rescan_devices
+            || (demod == Demod::Wfm && dev.kind == Kind::Uhd
+                && (a.rx_dual != dual || (!dual && a.rx_auto != auto_rx)))
+        {
+            return (dev, Ok(()));
+        }
+    }
+    let selected_antenna = survey.as_ref().map(|s| s.measurements[s.selected].antenna);
+    let (streams, stream_set, enh_set0, am_bw, rx1_antenna) = {
+        let a = app.lock().unwrap();
+        (a.streams.clone(), a.stream.clone(), a.enhance.clone(), a.audio.am_bw_hz as f64, a.rx1_antenna.clone())
     };
     // stream only when something can carry the audio out
     let streaming = stream_set.server || stream_set.icecast.enabled;
@@ -476,10 +655,15 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
     } else {
         Vec::new()
     };
-    let (rate, lo_target, freqs, skipped) = plan_session(dev.kind, f, demod, &extras);
+    let (rate, lo_target, freqs, skipped) = plan_session(dev.kind, f, demod, &extras, dual);
     let setup = (|| -> Result<f64, String> {
         dev.ensure_rate(rate)?;
-        dev.apply_controls(app)?;
+        dev.apply_controls(app, selected_antenna)?;
+        if let Sdr::Uhd(u) = &mut dev.sdr {
+            if dual {
+                u.set_second_antenna(&rx1_antenna)?;
+            }
+        }
         let lo = dev.sdr.tune(lo_target)?;
         dev.sdr.start_stream()?;
         Ok(lo)
@@ -488,10 +672,14 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
         Ok(lo) => lo,
         Err(e) => return (dev, Err(e)),
     };
+    let mut second_ch = None;
     let (mut ch, audio_rate, cutoff) = match demod {
         Demod::Wfm => {
             let d = (rate / MPX_RATE).round() as usize;
             let spec: Vec<(f64, f64, f64)> = freqs.iter().map(|x| (x - lo, 100e3, 114e3)).collect();
+            if dual {
+                second_ch = Some(Channelizer::new_multi(rate, d, 1 << 15, 1 << 11, &spec));
+            }
             (Channelizer::new_multi(rate, d, 1 << 15, 1 << 11, &spec), StereoDecoder::OUT_RATE, 15_000.0)
         }
         Demod::Am => {
@@ -561,6 +749,15 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
         a.live = Default::default();
         a.live.audio_device = out.as_ref().map(|o| o.device_name.clone());
         a.live.streams = live_streams.clone();
+        if let Some(s) = &survey {
+            let best = &s.measurements[s.selected];
+            a.push_log(format!("Auto RX selected RX {} · {} ({:.1} dB pilot, {:.1} dB RF contrast)", best.channel, best.antenna, best.pilot_db, best.contrast_db));
+        }
+        a.rx_survey = survey;
+        if dual {
+            let rx0 = a.antenna.clone();
+            a.push_log(format!("Dual RX at {:.2} MS/s per channel: RX 0 {rx0}, RX 1 {rx1_antenna}", rate / 1e6));
+        }
         a.push_log(format!(
             "Listening {label}{}{}",
             out.as_ref().map(|o| format!(" → {} ({} Hz)", o.device_name, o.rate)).unwrap_or_default(),
@@ -588,6 +785,7 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
         std::thread::spawn(move || {
             let mut dev = dev;
             let mut buf = vec![C32::default(); 1 << 16];
+            let mut second = dual.then(|| vec![C32::default(); buf.len()]);
             while !stop.load(Ordering::Relaxed) {
                 if let Some((g, ant, bias)) = ctrl.lock().unwrap().take() {
                     let _ = dev.sdr.set_gain(g);
@@ -597,10 +795,11 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
                     dev.antenna = Some(ant);
                     dev.bias = Some(bias);
                 }
-                match dev.sdr.read(&mut buf) {
+                match dev.sdr.read(&mut buf, second.as_deref_mut()) {
                     Ok(0) => {}
                     Ok(n) => {
-                        if let Err(TrySendError::Full(_)) = tx.try_send(Block::Data(buf[..n].to_vec())) {
+                        let second = second.as_ref().map(|s| s[..n].to_vec());
+                        if let Err(TrySendError::Full(_)) = tx.try_send(Block::Data(buf[..n].to_vec(), second)) {
                             dropped.fetch_add(1, Ordering::Relaxed);
                         }
                     }
@@ -618,7 +817,11 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
     let mut out_rs = out.as_ref().map(|o| Resampler::new(PROGRAM_RATE, o.rate as f64));
     let mut recorder: Option<Recorder> = None;
     let mut outs: Vec<Vec<C32>> = vec![Vec::new(); chans.len()];
+    let mut second_outs = dual.then(|| vec![Vec::new(); chans.len()]);
+    let mut diversity = Diversity::default();
+    let mut dual_samples = 0u64;
     let mut mpx = Vec::new();
+    let mut mpx_second = Vec::new();
     let mut native: Vec<Frame> = Vec::new();
     let mut a48: Vec<Frame> = Vec::new();
     let mut outbuf: Vec<Frame> = Vec::new();
@@ -626,22 +829,26 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
     let mut last_save = Instant::now();
     let mut last_title = Instant::now();
     let mut cur_am_bw = am_bw;
-    let mut cur_ctrl = dev_ctrl_snapshot(app);
+    let mut cur_ctrl = dev_ctrl_snapshot(app, selected_antenna);
     let session_streams = (streams.clone(), stream_set.clone());
     let result: Result<(), String> = loop {
-        let blk = match rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Block::Data(d)) => d,
+        let (blk, second_blk) = match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Block::Data(d, second)) => (d, second),
             Ok(Block::Err(e)) => break Err(e),
             Err(RecvTimeoutError::Timeout) => break Err("no samples from the device for 3 s".into()),
             Err(RecvTimeoutError::Disconnected) => break Err("device reader stopped".into()),
         };
         // settings snapshot
-        let (mode, dev_id, reopen, audio_set, enh_set, rec_req, restart) = {
-            let mut a = app.lock().unwrap();
-            let rec_req = a.rec_request.take();
+        let (mode, dev_id, reopen, audio_set, enh_set, restart) = {
+            let a = app.lock().unwrap();
             let restart = (a.streams.clone(), a.stream.clone()) != session_streams;
-            let reopen = a.rescan_devices || (dev_kind == Kind::Uhd && a.rx_channel != rx_channel);
-            (a.mode, a.device_id.clone(), reopen, a.audio.clone(), a.enhance.clone(), rec_req, restart)
+            let want_dual = dev_kind == Kind::Uhd && demod == Demod::Wfm && a.rx_dual;
+            let auto = dev_kind == Kind::Uhd && demod == Demod::Wfm && !want_dual && a.rx_auto;
+            let reopen = a.rescan_devices || auto != auto_rx || want_dual != dual
+                || (dual && a.rx1_antenna != rx1_antenna)
+                || (dev_kind == Kind::Uhd && !auto && !dual && a.rx_channel != rx_channel)
+                || (auto && a.rx_recheck);
+            (a.mode, a.device_id.clone(), reopen, a.audio.clone(), a.enhance.clone(), restart)
         };
         // Drag-tuning: a new frequency inside the current capture is just a different
         // FFT slice, so move the channel in place instead of restarting the stream.
@@ -649,13 +856,19 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
             let nf = nh as f64;
             let margin = if demod == Demod::Wfm { 130e3 } else { cur_am_bw + 20e3 };
             let inside = (nf - lo).abs() < rate / 2.0 - margin && (nf - lo).abs() > 60e3;
-            if nd == demod && nh != hz && chans.len() == 1 && chans[0].mount.is_none() && inside {
+            if !auto_rx && nd == demod && nh != hz && chans.len() == 1 && chans[0].mount.is_none() && inside {
                 hz = nh;
                 f = nf;
                 label = label_of(f);
                 chans[0] = Chan::new(f, true, audio_rate, if demod == Demod::Wfm { 15_000.0 } else { cur_am_bw });
                 match demod {
-                    Demod::Wfm => ch.set_filter(0, f - lo, 100e3, 114e3),
+                    Demod::Wfm => {
+                        ch.set_filter(0, f - lo, 100e3, 114e3);
+                        if let Some(ch) = &mut second_ch {
+                            ch.set_filter(0, f - lo, 100e3, 114e3);
+                            diversity = Diversity::default();
+                        }
+                    }
                     Demod::Am => ch.set_filter(0, f - lo, cur_am_bw, cur_am_bw + 1_500.0),
                 }
                 let mut a = app.lock().unwrap();
@@ -668,7 +881,8 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
         if mode != (Mode::Listen { hz, demod }) || reopen || dev_id != app_open_id(app) || restart {
             break Ok(());
         }
-        let snap = dev_ctrl_snapshot(app);
+        let rec_req = app.lock().unwrap().rec_request.take();
+        let snap = dev_ctrl_snapshot(app, selected_antenna);
         if snap != cur_ctrl {
             *ctrl.lock().unwrap() = Some(snap.clone());
             cur_ctrl = snap;
@@ -719,26 +933,61 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
         // DSP
         if last_spec.elapsed() > Duration::from_millis(350) {
             ch.request_spectrum();
+            if let Some(ch) = &mut second_ch {
+                ch.request_spectrum();
+            }
             last_spec = Instant::now();
         }
         outs.iter_mut().for_each(Vec::clear);
         ch.push_multi(dsp, &blk, &mut outs);
+        if let (Some(ch), Some(blk), Some(outs)) = (&mut second_ch, &second_blk, &mut second_outs) {
+            outs.iter_mut().for_each(Vec::clear);
+            ch.push_multi(dsp, blk, outs);
+            dual_samples += blk.len() as u64;
+        }
         if outs[0].is_empty() {
             continue;
         }
         let mut peak = [0f32; 2];
         let mut rds_results = Vec::new();
+        let previous_rx = diversity.active;
+        let mut dual_status = None;
         for (i, c) in chans.iter_mut().enumerate() {
             let base = &outs[i];
-            c.pwr = base.iter().map(|v| v.norm_sqr()).sum::<f32>() / base.len().max(1) as f32;
+            c.pwr = iq_power(base);
             native.clear();
             match demod {
                 Demod::Wfm => {
                     mpx.clear();
                     c.disc.process(base, &mut mpx);
+                    if let Some(second) = &second_outs {
+                        mpx_second.clear();
+                        let second_base = &second[i];
+                        c.disc_second.process(second_base, &mut mpx_second);
+                        // Preserve a continuous RDS block on each channel regardless of audio switching.
+                        c.rds_acc_second.extend_from_slice(&mpx_second);
+                        let second_pwr = iq_power(second_base);
+                        if c.main {
+                            let (pilot0, noise0) = dsp.fm_reception(&mpx);
+                            let (pilot1, noise1) = dsp.fm_reception(&mpx_second);
+                            let pilot_db = [pilot0, pilot1];
+                            let level_db = [c.pwr, second_pwr].map(|p| 10.0 * (p + 1e-30).log10());
+                            diversity.update(pilot_db, [noise0, noise1], level_db);
+                            dual_status = Some(DualRxStatus { selected: diversity.active, pilot_db, level_db, samples: dual_samples });
+                        }
+                        c.rds_acc.extend_from_slice(&mpx);
+                        if diversity.active == 1 {
+                            std::mem::swap(&mut mpx, &mut mpx_second);
+                            c.pwr = second_pwr;
+                        }
+                        if previous_rx != diversity.active {
+                            fade_to(&mut mpx, &mpx_second);
+                        }
+                    } else {
+                        c.rds_acc.extend_from_slice(&mpx);
+                    }
                     let mode = if c.main { audio_set.stereo } else { crate::demod::StereoMode::Auto };
                     c.stereo.process(&mpx, mode, audio_set.deemph_us, &mut native);
-                    c.rds_acc.extend_from_slice(&mpx);
                 }
                 Demod::Am => c.am.process(base, &mut native),
             }
@@ -770,7 +1019,13 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
             }
             // RDS every 2.3 s of MPX
             if demod == Demod::Wfm && c.rds_acc.len() >= MPX_LEN {
-                let block: Vec<f32> = c.rds_acc.drain(..MPX_LEN).collect();
+                let primary = c.rds_acc.drain(..MPX_LEN);
+                let block: Vec<f32> = if dual {
+                    let secondary = c.rds_acc_second.drain(..MPX_LEN);
+                    if diversity.active == 1 { secondary.collect() } else { primary.collect() }
+                } else {
+                    primary.collect()
+                };
                 let info = dsp.analyze_mpx(&block);
                 let bits = dsp::rds_bits(&info.rds_bb, info.pilot_bb.as_deref());
                 let (groups, stats) = find_groups(&bits);
@@ -785,7 +1040,9 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
             }
         }
 
-        let spec = ch.take_spectrum();
+        let primary_spec = ch.take_spectrum();
+        let secondary_spec = second_ch.as_mut().and_then(Channelizer::take_spectrum);
+        let spec = if diversity.active == 1 { secondary_spec } else { primary_spec };
         {
             let mut a = app.lock().unwrap();
             let mut events = Vec::new();
@@ -797,6 +1054,7 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
             }
             let main = &chans[0];
             let l = &mut a.live;
+            l.dual_rx = dual_status;
             l.pilot_locked = demod == Demod::Wfm && main.stereo.pilot_locked;
             l.stereo_blend = l.pilot_locked && audio_set.stereo == crate::demod::StereoMode::Auto;
             l.pilot_level = main.stereo.pilot_level;
@@ -851,6 +1109,8 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
         a.rec_status = None;
         a.live.streams.clear();
         a.live.station_aliases.clear();
+        a.live.dual_rx = None;
+        a.rx_survey = None;
     }
     stop.store(true, Ordering::Relaxed);
     drop(rx);
@@ -859,9 +1119,9 @@ fn listen_session(dev: Open, dsp: &mut Dsp, app: &Arc<Mutex<App>>, hz: u64, demo
     (dev, result)
 }
 
-fn dev_ctrl_snapshot(app: &Arc<Mutex<App>>) -> (Option<f64>, String, bool) {
+fn dev_ctrl_snapshot(app: &Arc<Mutex<App>>, antenna: Option<&str>) -> (Option<f64>, String, bool) {
     let a = app.lock().unwrap();
-    (if a.agc { None } else { Some(a.gain) }, a.antenna.clone(), a.bias_tee)
+    (if a.agc { None } else { Some(a.gain) }, antenna.unwrap_or(&a.antenna).to_owned(), a.bias_tee)
 }
 
 fn app_open_id(app: &Arc<Mutex<App>>) -> String {
@@ -905,9 +1165,15 @@ pub fn run(app: Arc<Mutex<App>>, cfg: WorkerCfg) {
             let found: Vec<String> = a.devices.iter().filter(|d| d.present).map(|d| d.label.clone()).collect();
             a.push_log(if found.is_empty() { "No SDR found".to_string() } else { format!("Found: {}", found.join(", ")) });
         }
-        let (mode, want_id, info, dirty, rx_channel) = {
-            let a = app.lock().unwrap();
-            (a.mode, a.device_id.clone(), a.selected_device().cloned(), a.settings_dirty, a.rx_channel)
+        let (mode, want_id, info, dirty, rx_channel, auto_rx, dual) = {
+            let mut a = app.lock().unwrap();
+            let info = a.selected_device().cloned();
+            let uhd_fm = matches!(a.mode, Mode::Listen { demod: Demod::Wfm, .. })
+                && info.as_ref().is_some_and(|d| d.kind == Kind::Uhd);
+            let dual = uhd_fm && a.rx_dual;
+            let auto = uhd_fm && !dual && a.rx_auto;
+            a.rx_recheck = false;
+            (a.mode, a.device_id.clone(), info, a.settings_dirty, a.rx_channel, auto, dual)
         };
         if dirty {
             app.lock().unwrap().save_settings();
@@ -921,21 +1187,24 @@ pub fn run(app: Arc<Mutex<App>>, cfg: WorkerCfg) {
             std::thread::sleep(Duration::from_millis(200));
             continue;
         }
-        if dev.as_ref().is_none_or(|d| d.id != want_id || (d.kind == Kind::Uhd && d.rx_channel != rx_channel)) {
+        if dev.as_ref().is_none_or(|d| {
+            d.id != want_id || d.dual != dual || (d.kind == Kind::Uhd && !auto_rx && !dual && d.rx_channel != rx_channel)
+        }) {
             dev = None;
             let Some(info): Option<DeviceInfo> = info.clone() else {
                 std::thread::sleep(Duration::from_millis(300));
                 continue;
             };
             app.lock().unwrap().status = format!("Opening {}…", info.label);
-            match Sdr::open(&info, &cfg.paths, rx_channel) {
+            let rx_channel = if auto_rx || dual { 0 } else { rx_channel };
+            match Sdr::open(&info, &cfg.paths, rx_channel, dual) {
                 Ok(sdr) => {
                     let mut a = app.lock().unwrap();
                     a.error = None;
                     a.open_device = Some(info.id.clone());
-                    let input = if info.kind == Kind::Uhd { format!(" · RX {rx_channel}") } else { String::new() };
+                    let input = if dual { " · Dual RX".into() } else if info.kind == Kind::Uhd { format!(" · RX {rx_channel}") } else { String::new() };
                     a.push_log(format!("Opened {}{input}", info.label));
-                    dev = Some(Open { id: info.id.clone(), kind: info.kind, rx_channel, sdr, rate: 0.0, gain: None, antenna: None, bias: None });
+                    dev = Some(Open { id: info.id.clone(), kind: info.kind, rx_channel, dual, sdr, rate: 0.0, gain: None, antenna: None, bias: None });
                 }
                 Err(e) => {
                     let msg = hint(&e);
@@ -955,7 +1224,7 @@ pub fn run(app: Arc<Mutex<App>>, cfg: WorkerCfg) {
         let mut d = dev.take().unwrap();
         let res = match mode {
             Mode::Scan => {
-                let r = d.apply_controls(&app).and_then(|_| scan_step(&mut d, &mut dsp, &app, &mut chunk, &cfg));
+                let r = d.apply_controls(&app, None).and_then(|_| scan_step(&mut d, &mut dsp, &app, &mut chunk, &cfg));
                 dev = Some(d);
                 r
             }
@@ -975,7 +1244,7 @@ pub fn run(app: Arc<Mutex<App>>, cfg: WorkerCfg) {
                     a.mode = Mode::Idle;
                     continue;
                 }
-                let (d2, r) = listen_session(d, &mut dsp, &app, hz, demod, &cfg);
+                let (d2, r) = listen_session(d, &mut dsp, &app, hz, demod, auto_rx, &cfg);
                 dev = Some(d2);
                 r
             }

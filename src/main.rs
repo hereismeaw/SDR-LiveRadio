@@ -25,6 +25,9 @@ Options:
   --gain <dB>        RX gain (default 30); --agc for automatic gain (RTL-SDR)
   --antenna <name>   TX/RX or RX2 (UHD only, default TX/RX)
   --rx-channel <n>  UHD receive channel 0 or 1 (default 0 on a new install)
+  --rx-auto         Compare UHD antenna inputs when tuning to FM
+  --rx-dual         Receive FM on both B210 channels at the same time
+  --rx1-antenna <name>  RX 1 port in Dual RX (default RX2); --antenna sets RX 0
   --port <n>         web UI port (default 8765)
   --no-open          do not open the browser
   --uhd-dll <path>   path to uhd.dll
@@ -47,6 +50,9 @@ fn main() {
     let mut agc = false;
     let mut antenna: Option<String> = None;
     let mut rx_channel: Option<usize> = None;
+    let mut rx_auto = false;
+    let mut rx_dual = false;
+    let mut rx1_antenna = None;
     let mut want_dev: Option<String> = None;
     let mut port: u16 = 8765;
     let mut open_browser = true;
@@ -70,6 +76,15 @@ fn main() {
             "--rx-channel" => {
                 let n = val("--rx-channel").parse::<usize>().ok().filter(|&n| n <= 1);
                 rx_channel = Some(n.unwrap_or_else(|| die("--rx-channel must be 0 or 1")));
+            }
+            "--rx-auto" => rx_auto = true,
+            "--rx-dual" => rx_dual = true,
+            "--rx1-antenna" => {
+                let port = val("--rx1-antenna");
+                if !matches!(port.as_str(), "TX/RX" | "RX2") {
+                    die("--rx1-antenna must be TX/RX or RX2");
+                }
+                rx1_antenna = Some(port);
             }
             "--device" => want_dev = Some(val("--device")),
             "--port" => port = val("--port").parse().unwrap_or_else(|_| die("invalid --port")),
@@ -139,6 +154,16 @@ fn main() {
 
     let mut a = App::new(mode, 30.0, "TX/RX".into());
     a.load_settings_file();
+    if rx_auto && rx_dual {
+        die("choose --rx-auto or --rx-dual");
+    }
+    if rx_auto || rx_dual || rx_channel.is_some() || antenna.is_some() {
+        a.rx_auto = rx_auto;
+        a.rx_dual = rx_dual;
+    }
+    if let Some(port) = rx1_antenna {
+        a.rx1_antenna = port;
+    }
     if let Some(channel) = rx_channel {
         a.rx_channel = channel;
     }

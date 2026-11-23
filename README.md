@@ -31,11 +31,20 @@
 | FM scan | 4.56 MS/s, 4 MHz per hop | 2.28 MS/s, 2 MHz per hop |
 | Multi-station streaming | ≈ ±1.8 MHz around the tuned station | ≈ ±0.85 MHz |
 
-The LibreSDR B210mini reports **two simultaneous receive chains** in UHD. Each chain lets you select **TX/RX** or **RX2**, for four physical port choices in total. The app captures one chain at a time. Choose **RX 0** or **RX 1** in the toolbar, then choose the port your antenna is connected to. The other chain could be used for antenna diversity or a side-by-side signal and RDS error-rate comparison. The two chains share the receive LO, and both streams would count toward the USB bandwidth budget. [Ettus B2x0 hardware notes](https://files.ettus.com/manual_archive/v4.5.0.0/html/page_usrp_b200.html)
+### B210 antenna modes
 
-Lessons learned the hard way:
+The LibreSDR B210mini reports **two receive chains** in UHD. Each chain can select **TX/RX** or **RX2**. Choose a receive mode in the toolbar. FM band scans and AM use the manual input. [Ettus B2x0 hardware notes](https://files.ettus.com/manual_archive/v4.5.0.0/html/page_usrp_b200.html)
+
+- **Dual RX** receives through RX 0 and RX 1 simultaneously. Choose one port per channel, then press **Listen**. The app demodulates both inputs and switches the audio to the cleaner one when its advantage persists. Hover over **Using RX** for the signal level and stereo pilot SNR of both inputs. The B210 shares its receive LO, so both inputs cover the same RF window.
+- **Auto RX** samples all four ports in sequence when you tune to an FM station and selects the best input. Hover over the selected input for the readings, or use **Recheck** to repeat the comparison.
+- **Manual RX** lets you choose a channel and a port.
+
+Dual RX uses 1.14 MS/s per input for a single station and up to 2.28 MS/s per input when streaming nearby stations. I tested simultaneous reception and RDS decoding at 97.00 and 102.50 MHz on my LibreSDR B210mini over USB 2.0. The same setup streamed 97.00 and 98.50 MHz together.
+
+### Bench notes
+
 - **UHD 4.11 compares serial numbers as hex.** My clone shipped with serial `OVXI4WE`, so it was never found when the serial was given (SDRangel always gives one). The fix is to burn a hex serial: `usrp_burn_mb_eeprom --args type=b200 --values serial=B210A1C`.
-- USB 2.0 tops out at ~8 MS/s sc16, so everything here is designed to stay at or below 4.56 MS/s.
+- The app budgets 4.56 MS/s total in sc16 on USB 2.0, shared across both inputs in Dual RX.
 - Some RDS error correction is good. Too much is bad: correcting 5-bit bursts turned `MUSIC` into `MUSQL`.
 
 ## Build & run
@@ -46,6 +55,8 @@ target\release\rds-fm-gui.exe            # the app
 target\release\rds-fm-gui.exe tune 97.0  # start on a station
 target\release\rds-fm.exe devices        # list SDRs
 target\release\rds-fm.exe tune 102.5 --device uhd --rx-channel 1 --antenna RX2
+target\release\rds-fm.exe tune 102.5 --device uhd --rx-auto
+target\release\rds-fm.exe tune 102.5 --device uhd --rx-dual --antenna RX2 --rx1-antenna TX/RX
 target\release\rds-fm.exe tune 97.0 --stream 0.0.0.0:8000 --also 95.5,98.5   # headless, 3 streams
 target\release\rds-fm.exe selftest       # synthetic-signal self test, no hardware needed
 target\release\rds-fm.exe tmc-download   # fetch the RDS-TMC event list

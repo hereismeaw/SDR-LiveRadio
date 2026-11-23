@@ -123,9 +123,9 @@ pub enum Sdr {
 }
 
 impl Sdr {
-    pub fn open(info: &DeviceInfo, paths: &DriverPaths, rx_channel: usize) -> Result<Self, String> {
+    pub fn open(info: &DeviceInfo, paths: &DriverPaths, rx_channel: usize, dual: bool) -> Result<Self, String> {
         match info.kind {
-            Kind::Uhd => Usrp::open(&paths.uhd_dll, &info.open_arg, rx_channel).map(Sdr::Uhd),
+            Kind::Uhd => Usrp::open(&paths.uhd_dll, &info.open_arg, rx_channel, dual).map(Sdr::Uhd),
             Kind::RtlSdr => {
                 let idx = info.open_arg.parse().unwrap_or(0);
                 RtlSdr::open(&paths.rtl_dll, idx).map(Sdr::Rtl)
@@ -217,9 +217,9 @@ impl Sdr {
         }
     }
 
-    pub fn read(&mut self, out: &mut [C32]) -> Result<usize, String> {
+    pub fn read(&mut self, out: &mut [C32], second: Option<&mut [C32]>) -> Result<usize, String> {
         match self {
-            Sdr::Uhd(u) => u.read(out),
+            Sdr::Uhd(u) => u.read(out, second),
             Sdr::Rtl(r) => r.read(out),
         }
     }

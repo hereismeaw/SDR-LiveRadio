@@ -54,6 +54,13 @@ fn band_power(spec: &[C32], bin_hz: f64, lo: f64, hi: f64) -> (f64, usize) {
     (s, b - a + 1)
 }
 
+fn pilot_snr(spec: &[C32], bin: f64) -> f32 {
+    let (ps, pn) = band_power(spec, bin, 18_985.0, 19_015.0);
+    let (ns, nn) = band_power(spec, bin, 17_000.0, 18_500.0);
+    let noise_density = ns / nn as f64 + 1e-30;
+    (10.0 * (ps / (noise_density * pn as f64) + 1e-30).log10()) as f32
+}
+
 pub struct MpxInfo {
     /// 19 kHz pilot vs. noise in the same bandwidth (dB). > ~15 dB means stereo.
     pub pilot_db: f32,
@@ -151,10 +158,7 @@ impl Dsp {
         self.fft(&mut p);
         let bin = MPX_RATE / l as f64;
 
-        let (ps, pn) = band_power(&p, bin, 18_985.0, 19_015.0);
-        let (ns, nn) = band_power(&p, bin, 17_000.0, 18_500.0);
-        let noise_density = ns / nn as f64 + 1e-30;
-        let pilot_db = (10.0 * (ps / (noise_density * pn as f64) + 1e-30).log10()) as f32;
+        let pilot_db = pilot_snr(&p, bin);
 
         let (rs, rn) = band_power(&p, bin, 55_600.0, 58_400.0);
         let (qs, qn) = band_power(&p, bin, 60_500.0, 63_300.0);
@@ -165,6 +169,20 @@ impl Dsp {
         // Pilot at the same rate and length, so it is sample-aligned with rds_bb.
         let pilot_bb = (pilot_db > PILOT_COHERENT_DB).then(|| self.pilot_from_spectrum(&p));
         MpxInfo { pilot_db, rds_snr_db, rds_bb, pilot_bb }
+    }
+
+    pub fn fm_pilot_snr(&mut self, mpx: &[f32]) -> f32 {
+        self.fm_reception(mpx).0
+    }
+
+    /// Stereo pilot SNR and ultrasonic MPX noise power, both in dB.
+    pub fn fm_reception(&mut self, mpx: &[f32]) -> (f32, f32) {
+        let mut spectrum: Vec<C32> = mpx.iter().map(|&v| C32::new(v, 0.0)).collect();
+        self.fft(&mut spectrum);
+        let bin = MPX_RATE / mpx.len() as f64;
+        let (noise, _) = band_power(&spectrum, bin, 64_000.0, 95_000.0);
+        let noise_db = (10.0 * (noise / (mpx.len() as f64).powi(2) + 1e-30).log10()) as f32;
+        (pilot_snr(&spectrum, bin), noise_db)
     }
 }
 

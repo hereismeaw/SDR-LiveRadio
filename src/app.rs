@@ -195,12 +195,35 @@ pub struct Live {
     pub streams: Vec<LiveStream>,
     /// Tuned kHz -> station kHz, confirmed by PI in the current listen session.
     pub station_aliases: BTreeMap<u32, u32>,
+    pub dual_rx: Option<DualRxStatus>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DualRxStatus {
+    pub selected: usize,
+    pub pilot_db: [f32; 2],
+    pub level_db: [f32; 2],
+    pub samples: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct RecStatus {
     pub path: PathBuf,
     pub seconds: f64,
+}
+
+pub struct RxMeasurement {
+    pub channel: usize,
+    pub antenna: &'static str,
+    pub level_db: f32,
+    pub pilot_db: f32,
+    pub contrast_db: f32,
+    pub clipped: bool,
+}
+
+pub struct RxSurvey {
+    pub measurements: Vec<RxMeasurement>,
+    pub selected: usize,
 }
 
 pub struct App {
@@ -218,6 +241,11 @@ pub struct App {
     pub agc: bool,
     pub antenna: String,
     pub rx_channel: usize,
+    pub rx_auto: bool,
+    pub rx_dual: bool,
+    pub rx1_antenna: String,
+    pub rx_recheck: bool,
+    pub rx_survey: Option<RxSurvey>,
     pub bias_tee: bool,
     pub audio: AudioSettings,
     pub rec: RecordSettings,
@@ -265,6 +293,11 @@ impl App {
             agc: false,
             antenna,
             rx_channel: 0,
+            rx_auto: false,
+            rx_dual: false,
+            rx1_antenna: "RX2".into(),
+            rx_recheck: false,
+            rx_survey: None,
             bias_tee: false,
             audio: AudioSettings::default(),
             rec: RecordSettings::default(),
@@ -392,6 +425,16 @@ impl App {
     }
 
     pub fn to_json(&self) -> Value {
+        let dual_rx = self.live.dual_rx.as_ref().map(|d| json!({
+            "selected": d.selected, "pilot_db": d.pilot_db, "level_db": d.level_db, "samples": d.samples,
+        }));
+        let rx_survey = self.rx_survey.as_ref().map(|survey| {
+            let measurements: Vec<_> = survey.measurements.iter().map(|p| json!({
+                "channel": p.channel, "antenna": p.antenna, "level_db": p.level_db,
+                "pilot_db": p.pilot_db, "contrast_db": p.contrast_db, "clipped": p.clipped,
+            })).collect();
+            json!({ "selected": survey.selected, "measurements": measurements })
+        });
         json!({
             "status": self.status,
             "error": self.error,
@@ -401,6 +444,11 @@ impl App {
             "gain": self.gain,
             "antenna": self.antenna,
             "rx_channel": self.rx_channel,
+            "rx_auto": self.rx_auto,
+            "rx_survey": rx_survey,
+            "rx_dual": self.rx_dual,
+            "rx1_antenna": self.rx1_antenna,
+            "dual_rx": dual_rx,
             "sweeps": self.sweeps,
             "clip": self.clip,
             "uptime_s": self.started.elapsed().as_secs(),
@@ -439,6 +487,9 @@ impl App {
             "band_freq": self.band_freq.iter().map(|(b, f)| (b.key().to_string(), json!(f))).collect::<serde_json::Map<_, _>>(),
             "gain": self.gain, "agc": self.agc, "antenna": self.antenna, "bias_tee": self.bias_tee,
             "rx_channel": self.rx_channel,
+            "rx_auto": self.rx_auto,
+            "rx_dual": self.rx_dual,
+            "rx1_antenna": self.rx1_antenna,
             "traffic_alert": self.traffic_alert,
             "audio": {
                 "output": a.output, "volume": a.volume, "muted": a.muted,
@@ -490,6 +541,9 @@ impl App {
         self.agc = b("agc").unwrap_or(self.agc);
         self.antenna = s("antenna").unwrap_or(self.antenna.clone());
         self.rx_channel = v.get("rx_channel").and_then(Value::as_u64).filter(|&n| n <= 1).unwrap_or(0) as usize;
+        self.rx_auto = b("rx_auto").unwrap_or(false);
+        self.rx_dual = b("rx_dual").unwrap_or(false);
+        self.rx1_antenna = s("rx1_antenna").filter(|a| a == "TX/RX" || a == "RX2").unwrap_or_else(|| "RX2".into());
         self.bias_tee = b("bias_tee").unwrap_or(false);
         self.traffic_alert = b("traffic_alert").unwrap_or(true);
         if let Some(a) = v.get("audio") {

@@ -23,7 +23,7 @@ The owner writes in Thai; reply in Thai. The UI and README are English by reques
 
 ```powershell
 cargo build --release
-cargo test --release              # 31 tests, ~3 s, no hardware needed
+cargo test --release              # 33 tests, ~3 s, no hardware needed
 target\release\rds-fm-gui.exe     # GUI. The owner runs it from dist\RDS FM Monitor.exe (a copy)
 target\release\rds-fm.exe --help  # CLI + web UI (http://127.0.0.1:8765), useful for headless hardware tests
 target\release\rds-fm.exe selftest
@@ -79,7 +79,7 @@ Runtime data lives in `%APPDATA%\rds-fm\`: `settings.json` (it includes the Icec
 7. **The GPL TMC event list is never committed.** It is downloaded to `%APPDATA%` on request (`rds-fm tmc-download` or the Traffic tab).
 8. **Station keys are kHz.** In scan mode a detection ±50 kHz from a known station is merged into it.
 9. **Streaming only when a server or Icecast is enabled.** Otherwise no MP3 encoding happens and the "ON AIR" badge stays off.
-10. **One UHD RX chain at a time.** The B210 exposes RX 0 and RX 1, each selectable between TX/RX and RX2. A change to the RX chain reopens UHD. A future two-chain capture must account for the shared receive LO and the aggregate USB sample rate.
+10. **Dual RX listening uses the shared B210 RX LO and a timed two-channel UHD streamer.** Its 27.36 MHz master clock supports exact 1.14 or 2.28 MS/s on both channels. Keep the aggregate rate at or below 4.56 MS/s on USB 2.0. Demodulate both inputs before crossfading audio and keep their RDS blocks separate. Auto RX still surveys all four ports in sequence. FM scan and AM use the manual input.
 
 ## 5. Environment facts learned the hard way
 
@@ -107,7 +107,7 @@ Off-grid FM listening now associates RDS with a known station within ±50 kHz wh
 The Traffic tab has iTIC's Bangkok FM shortcuts (102.50 and 88.50 MHz) and a local location-name import. The ALERT-C receiver pairs repeated data groups from the announced transmitter and assembles multipart payloads. The synthetic FM/RDS self-test verifies one event through the signal chain. On-air testing in Bangkok received ordinary RDS on 102.50 MHz and has yet to confirm an ALERT-C broadcast on either documented frequency.
 
 1. **RTL-SDR V4 is untested**: open, gain table, HF upconverter path (MW/SW), streaming read loop, sample-rate acceptance at 1.14/2.28 MS/s. The owner needs the WinUSB driver (Zadig).
-2. **Dual RX**: try antenna diversity with two antennas, using aligned IQ or switching by pilot quality and RDS block errors.
+2. **Dual RX**: selection diversity is implemented. Coherent IQ combining would require estimating the relative channel phase and amplitude.
 3. **License is undecided** (README says so). Ask before adding one.
 4. **The web UI (`web/index.html`)** lacks the newer features (bands, audio, streams, presets).
 5. **Thai TMC location table**: obtain a matching table from iTIC and normalize it for the local location CSV importer. The event list (1402 events) works.

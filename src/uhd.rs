@@ -54,11 +54,13 @@ const STREAM_MODE_STOP_CONTINUOUS: i32 = 111;
 const TUNE_POLICY_AUTO: i32 = 65;
 const MD_ERROR_TIMEOUT: i32 = 0x1;
 const MD_ERROR_OVERFLOW: i32 = 0x8;
+const MD_ERROR_ALIGNMENT: i32 = 0xC;
 
 struct Api {
     usrp_make: unsafe extern "C" fn(*mut Handle, *const c_char) -> UhdErr,
     usrp_free: unsafe extern "C" fn(*mut Handle) -> UhdErr,
     get_rx_num_channels: unsafe extern "C" fn(Handle, *mut usize) -> UhdErr,
+    get_time_now: unsafe extern "C" fn(Handle, usize, *mut i64, *mut f64) -> UhdErr,
     set_rx_rate: unsafe extern "C" fn(Handle, f64, usize) -> UhdErr,
     get_rx_rate: unsafe extern "C" fn(Handle, usize, *mut f64) -> UhdErr,
     set_rx_freq: unsafe extern "C" fn(Handle, *mut TuneRequest, usize, *mut TuneResult) -> UhdErr,
@@ -99,6 +101,7 @@ impl Api {
             usrp_make: sym!(lib, "uhd_usrp_make"),
             usrp_free: sym!(lib, "uhd_usrp_free"),
             get_rx_num_channels: sym!(lib, "uhd_usrp_get_rx_num_channels"),
+            get_time_now: sym!(lib, "uhd_usrp_get_time_now"),
             set_rx_rate: sym!(lib, "uhd_usrp_set_rx_rate"),
             get_rx_rate: sym!(lib, "uhd_usrp_get_rx_rate"),
             set_rx_freq: sym!(lib, "uhd_usrp_set_rx_freq"),
@@ -164,6 +167,8 @@ pub struct Usrp {
     streamer: Handle,
     md: Handle,
     channel: usize,
+    rx_channels: usize,
+    dual: bool,
     max_samps: usize,
     pub overflows: u64,
 }
@@ -175,13 +180,25 @@ impl Usrp {
     /// Start continuous streaming (use `read` to receive, `stop_stream` to end).
     pub fn start_stream(&mut self) -> Result<(), String> {
         self.flush();
-        let cmd = StreamCmd {
+        let mut cmd = StreamCmd {
             stream_mode: STREAM_MODE_START_CONTINUOUS,
             num_samps: 0,
             stream_now: true,
             time_spec_full_secs: 0,
             time_spec_frac_secs: 0.0,
         };
+        if self.dual {
+            // Schedule both frontends against the same device clock.
+            self.api.check(unsafe {
+                (self.api.get_time_now)(self.usrp, 0, &mut cmd.time_spec_full_secs, &mut cmd.time_spec_frac_secs)
+            }, "read device time")?;
+            cmd.time_spec_frac_secs += 0.15;
+            if cmd.time_spec_frac_secs >= 1.0 {
+                cmd.time_spec_full_secs += 1;
+                cmd.time_spec_frac_secs -= 1.0;
+            }
+            cmd.stream_now = false;
+        }
         self.api.check(unsafe { (self.api.streamer_issue)(self.streamer, &cmd) }, "start stream")
     }
 
@@ -199,11 +216,14 @@ impl Usrp {
 
     /// Receive up to `out.len()` samples of a continuous stream. Overflows are counted
     /// (the stream continues); a timeout is an error.
-    pub fn read(&mut self, out: &mut [C32]) -> Result<usize, String> {
-        let mut ptr = out.as_mut_ptr() as *mut c_void;
+    pub fn read(&mut self, out: &mut [C32], second: Option<&mut [C32]>) -> Result<usize, String> {
+        if self.dual != second.is_some() || second.as_ref().is_some_and(|s| s.len() < out.len()) {
+            return Err("RX buffers do not match the UHD streamer".into());
+        }
+        let mut ptrs = [out.as_mut_ptr().cast(), second.map_or(null_mut(), |s| s.as_mut_ptr().cast())];
         let mut items = 0usize;
         self.api.check(
-            unsafe { (self.api.streamer_recv)(self.streamer, &mut ptr, out.len(), &mut self.md, 1.0, false, &mut items) },
+            unsafe { (self.api.streamer_recv)(self.streamer, ptrs.as_mut_ptr(), out.len(), &mut self.md, 1.0, false, &mut items) },
             "recv",
         )?;
         let mut code = 0i32;
@@ -211,70 +231,143 @@ impl Usrp {
         match code {
             MD_ERROR_OVERFLOW => self.overflows += 1,
             MD_ERROR_TIMEOUT => return Err("timeout waiting for samples".into()),
+            MD_ERROR_ALIGNMENT => return Err("UHD could not align the two RX channels".into()),
             _ => {}
         }
         Ok(items)
     }
 
-    pub fn open(dll: &Path, args: &str, channel: usize) -> Result<Self, String> {
+    pub fn open(dll: &Path, args: &str, channel: usize, dual: bool) -> Result<Self, String> {
         let api = Api::load(dll)?;
+        // Dual-channel UHD is limited to a 30.72 MHz master clock. This clock
+        // gives integer decimation at both supported FM rates on both channels.
+        let dual_args;
+        let args = if dual {
+            dual_args = format!("{args},master_clock_rate=27360000");
+            dual_args.as_str()
+        } else {
+            args
+        };
         let cargs = CString::new(args).map_err(|e| e.to_string())?;
         let mut usrp: Handle = null_mut();
         api.check(unsafe { (api.usrp_make)(&mut usrp, cargs.as_ptr()) }, "open USRP")?;
         let mut u = Usrp {
-            api, usrp, channel, md: null_mut(), streamer: null_mut(), max_samps: 0, overflows: 0,
+            api, usrp, channel: if dual { 0 } else { channel }, rx_channels: 0, dual,
+            md: null_mut(), streamer: null_mut(), max_samps: 0, overflows: 0,
         };
         let mut count = 0;
         u.api.check(unsafe { (u.api.get_rx_num_channels)(u.usrp, &mut count) }, "RX channel count")?;
-        if channel >= count {
+        if dual && count < 2 {
+            return Err(format!("Dual RX requires two UHD receive channels. Found {count}."));
+        }
+        if u.channel >= count {
             return Err(format!("RX channel {channel} is unavailable. UHD reports {count} RX channel(s)."));
         }
+        u.rx_channels = count;
         u.api.check(unsafe { (u.api.md_make)(&mut u.md) }, "rx metadata")?;
         u.api.check(unsafe { (u.api.streamer_make)(&mut u.streamer) }, "rx streamer")?;
-        u.setup_stream()?;
+        u.max_samps = u.setup_stream(u.streamer, u.channels())?;
         Ok(u)
     }
 
-    fn setup_stream(&mut self) -> Result<(), String> {
+    pub fn rx_channels(&self) -> usize {
+        self.rx_channels
+    }
+
+    fn channels(&self) -> &[usize] {
+        if self.dual { &[0, 1] } else { std::slice::from_ref(&self.channel) }
+    }
+
+    /// Select a different single RX channel while the streamer is stopped.
+    pub fn select_rx_channel(&mut self, channel: usize) -> Result<(), String> {
+        if self.dual {
+            return Err("Channel selection requires a single RX streamer".into());
+        }
+        if channel == self.channel {
+            return Ok(());
+        }
+        if channel >= self.rx_channels {
+            return Err(format!("RX channel {channel} is unavailable"));
+        }
+        let mut streamer: Handle = null_mut();
+        self.api.check(unsafe { (self.api.streamer_make)(&mut streamer) }, "rx streamer")?;
+        match self.setup_stream(streamer, &[channel]) {
+            Ok(max_samps) => {
+                unsafe { (self.api.streamer_free)(&mut self.streamer) };
+                self.streamer = streamer;
+                self.max_samps = max_samps;
+                self.channel = channel;
+                Ok(())
+            }
+            Err(e) => {
+                unsafe { (self.api.streamer_free)(&mut streamer) };
+                Err(e)
+            }
+        }
+    }
+
+    fn setup_stream(&self, streamer: Handle, channels: &[usize]) -> Result<usize, String> {
         let cpu = CString::new("fc32").unwrap();
         let otw = CString::new("sc16").unwrap();
         let args = CString::new("").unwrap();
-        let chans = [self.channel];
         let mut sa = StreamArgs {
             cpu_format: cpu.as_ptr(),
             otw_format: otw.as_ptr(),
             args: args.as_ptr(),
-            channel_list: chans.as_ptr(),
-            n_channels: 1,
+            channel_list: channels.as_ptr(),
+            n_channels: channels.len() as i32,
         };
-        self.api.check(unsafe { (self.api.get_rx_stream)(self.usrp, &mut sa, self.streamer) }, "get_rx_stream")?;
+        self.api.check(unsafe { (self.api.get_rx_stream)(self.usrp, &mut sa, streamer) }, "get_rx_stream")?;
+        let mut max_samps = 0;
         self.api.check(
-            unsafe { (self.api.streamer_max_num_samps)(self.streamer, &mut self.max_samps) },
+            unsafe { (self.api.streamer_max_num_samps)(streamer, &mut max_samps) },
             "max_num_samps",
-        )
+        )?;
+        Ok(max_samps)
     }
 
     /// Set the RX sample rate; returns the actual rate. Recreates the stream.
     pub fn set_rate(&mut self, rate: f64) -> Result<f64, String> {
-        self.api.check(unsafe { (self.api.set_rx_rate)(self.usrp, rate, self.channel) }, "set_rx_rate")?;
+        for &channel in self.channels() {
+            self.api.check(unsafe { (self.api.set_rx_rate)(self.usrp, rate, channel) }, "set_rx_rate")?;
+        }
         let mut actual = 0.0;
-        self.api.check(unsafe { (self.api.get_rx_rate)(self.usrp, self.channel, &mut actual) }, "get_rx_rate")?;
-        self.setup_stream()?;
+        for &channel in self.channels() {
+            self.api.check(unsafe { (self.api.get_rx_rate)(self.usrp, channel, &mut actual) }, "get_rx_rate")?;
+            if (actual - rate).abs() > 1.0 {
+                return Err(format!("RX {channel} sample rate is {actual} Hz instead of {rate} Hz"));
+            }
+        }
+        self.max_samps = self.setup_stream(self.streamer, self.channels())?;
         Ok(actual)
     }
 
     pub fn set_gain(&mut self, gain: f64) -> Result<(), String> {
         let name = CString::new("").unwrap();
-        self.api.check(unsafe { (self.api.set_rx_gain)(self.usrp, gain, self.channel, name.as_ptr()) }, "set_rx_gain")
+        for &channel in self.channels() {
+            self.api.check(unsafe { (self.api.set_rx_gain)(self.usrp, gain, channel, name.as_ptr()) }, "set_rx_gain")?;
+        }
+        Ok(())
     }
 
     pub fn set_antenna(&mut self, ant: &str) -> Result<(), String> {
+        self.set_antenna_on(self.channel, ant)
+    }
+
+    pub fn set_second_antenna(&mut self, ant: &str) -> Result<(), String> {
+        self.set_antenna_on(1, ant)
+    }
+
+    fn set_antenna_on(&mut self, channel: usize, ant: &str) -> Result<(), String> {
         let a = CString::new(ant).map_err(|e| e.to_string())?;
-        self.api.check(unsafe { (self.api.set_rx_antenna)(self.usrp, a.as_ptr(), self.channel) }, "set_rx_antenna")
+        self.api.check(unsafe { (self.api.set_rx_antenna)(self.usrp, a.as_ptr(), channel) }, "set_rx_antenna")
     }
 
     pub fn set_bandwidth(&mut self, bw: f64) -> Result<(), String> {
-        self.api.check(unsafe { (self.api.set_rx_bandwidth)(self.usrp, bw, self.channel) }, "set_rx_bandwidth")
+        for &channel in self.channels() {
+            self.api.check(unsafe { (self.api.set_rx_bandwidth)(self.usrp, bw, channel) }, "set_rx_bandwidth")?;
+        }
+        Ok(())
     }
 
     /// Tune RX; returns the actual center frequency.
@@ -289,20 +382,30 @@ impl Usrp {
             args: args.as_ptr(),
         };
         let mut res = TuneResult::default();
-        self.api.check(unsafe { (self.api.set_rx_freq)(self.usrp, &mut req, self.channel, &mut res) }, "set_rx_freq")?;
+        for &channel in self.channels() {
+            self.api.check(unsafe { (self.api.set_rx_freq)(self.usrp, &mut req, channel, &mut res) }, "set_rx_freq")?;
+        }
         let mut f = 0.0;
         self.api.check(unsafe { (self.api.get_rx_freq)(self.usrp, self.channel, &mut f) }, "get_rx_freq")?;
+        if self.dual {
+            let mut second = 0.0;
+            self.api.check(unsafe { (self.api.get_rx_freq)(self.usrp, 1, &mut second) }, "get_rx_freq")?;
+            if (second - f).abs() > 100.0 {
+                return Err(format!("RX center frequencies differ: {f} Hz and {second} Hz"));
+            }
+        }
         Ok(f)
     }
 
     /// Drop any samples left in the transport from a previous burst.
     fn flush(&mut self) {
         let mut tmp = vec![C32::default(); self.max_samps.max(1)];
+        let mut second = vec![C32::default(); if self.dual { tmp.len() } else { 0 }];
+        let mut ptrs = [tmp.as_mut_ptr().cast(), second.as_mut_ptr().cast()];
         for _ in 0..1000 {
-            let mut ptr = tmp.as_mut_ptr() as *mut c_void;
             let mut items = 0usize;
             let rc = unsafe {
-                (self.api.streamer_recv)(self.streamer, &mut ptr, tmp.len(), &mut self.md, 0.02, false, &mut items)
+                (self.api.streamer_recv)(self.streamer, ptrs.as_mut_ptr(), tmp.len(), &mut self.md, 0.02, false, &mut items)
             };
             if rc != 0 || items == 0 {
                 break;
@@ -313,6 +416,9 @@ impl Usrp {
     /// Receive exactly `n` samples in one finite burst, discarding the first `discard`
     /// (LO / AGC settling after a retune).
     pub fn capture(&mut self, n: usize, discard: usize) -> Result<Vec<C32>, String> {
+        if self.dual {
+            return Err("Burst capture requires a single RX streamer".into());
+        }
         self.flush();
         let total = n + discard;
         let mut buf = vec![C32::default(); total];
